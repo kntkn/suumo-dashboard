@@ -256,10 +256,8 @@ async function run(mode) {
     await report({
       agent: "reins-sync",
       status: "success",
-      message: "新規物件なし",
-      total: allPages.length,
-      processed: 0,
-      properties: [],
+      synced: 0,
+      total_in_db: allPages.length,
     });
     return;
   }
@@ -277,15 +275,17 @@ async function run(mode) {
     await report({
       agent: "reins-sync",
       status: "error",
-      reason: `REINSログインを${MAX_LOGIN_RETRIES}回試みましたが完了できませんでした`,
+      error: "REINS_LOGIN_FAILED",
+      attempts: MAX_LOGIN_RETRIES,
+      last_url: page.url(),
     });
     process.exit(1);
   }
 
   // 4. Process each property
-  let successCount = 0;
-  let failedCount = 0;
-  const processed = [];
+  const synced = [];
+  const notFound = [];
+  const errors = [];
 
   for (let i = 0; i < targets.length; i++) {
     const { pageId, reinsId } = targets[i];
@@ -296,16 +296,16 @@ async function run(mode) {
     if (result.status === "ok") {
       const notionProps = buildNotionProps(result.data);
       await notion.pages.update({ page_id: pageId, properties: notionProps });
-
-      const building = result.data.建物名 || "不明";
-      const rent = result.data.賃料 || "不明";
+      const building = result.data.建物名 || "";
+      const rent = result.data.賃料 || "";
       console.error(`  -> ${building} / ${rent}`);
-      processed.push({ reinsId, building, rent });
-      successCount++;
+      synced.push({ reinsId, building, rent });
+    } else if (result.status === "not_found") {
+      console.error(`  -> not_found`);
+      notFound.push(reinsId);
     } else {
-      console.error(`  -> ${result.status}: ${result.error || ""}`);
-      processed.push({ reinsId, status: result.status, error: result.error });
-      failedCount++;
+      console.error(`  -> error: ${result.error}`);
+      errors.push({ reinsId, error: result.error });
     }
 
     await page.waitForTimeout(1000);
@@ -313,33 +313,20 @@ async function run(mode) {
 
   await browser.close();
 
-  // 5. Output JSON report + Slack notify
-  if (failedCount === 0) {
-    await report({
-      agent: "reins-sync",
-      status: "success",
-      total: allPages.length,
-      processed: successCount,
-      properties: processed.map((p) => ({
-        reinsId: p.reinsId,
-        building: p.building,
-        rent: p.rent,
-      })),
-    });
-  } else {
-    await report({
-      agent: "reins-sync",
-      status: successCount > 0 ? "partial" : "error",
-      reason:
-        successCount > 0
-          ? `${successCount}件成功、${failedCount}件失敗`
-          : `${failedCount}件の処理に失敗しました`,
-      total: allPages.length,
-      processed: successCount,
-      failed: failedCount,
-      properties: processed,
-    });
-  }
+  // 5. Build report
+  const r = {
+    agent: "reins-sync",
+    status: errors.length > 0 ? "error" : "success",
+    synced: synced.length,
+    not_found: notFound.length,
+    errors: errors.length,
+    total_in_db: allPages.length,
+  };
+  if (synced.length > 0) r.synced_properties = synced;
+  if (notFound.length > 0) r.not_found_ids = notFound;
+  if (errors.length > 0) r.error_details = errors;
+
+  await report(r);
 }
 
 // Parse CLI args
@@ -350,7 +337,8 @@ run(mode).catch(async (err) => {
   await report({
     agent: "reins-sync",
     status: "error",
-    reason: err.message,
+    error: err.message,
+    stack: err.stack?.split("\n").slice(0, 3).join(" | "),
   });
   process.exit(1);
 });
