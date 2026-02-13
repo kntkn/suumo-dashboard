@@ -30,4 +30,6 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           REINS_LOGIN_ID: ${{ secrets.REINS_LOGIN_ID }}
           REINS_LOGIN_PASS: ${{ secrets.REINS_LOGIN_PASS }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_REPORT_CHANNEL: ${{ secrets.SLACK_REPORT_CHANNEL }}
         run: bun scripts/reins-to-notion.js

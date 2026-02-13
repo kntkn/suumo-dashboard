@@ -24,10 +24,15 @@ if (fs.existsSync(envPath)) {
 
 const { chromium } = require("playwright");
 const { Client: NotionClient } = require("@notionhq/client");
+const { WebClient } = require("@slack/web-api");
 const reins = require("../skills/reins");
 
 const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
 const DB_ID = process.env.NOTION_DATABASE_ID;
+const slack = process.env.SLACK_BOT_TOKEN
+  ? new WebClient(process.env.SLACK_BOT_TOKEN)
+  : null;
+const SLACK_CHANNEL = process.env.SLACK_REPORT_CHANNEL || "ex_fango";
 
 const MAX_LOGIN_RETRIES = 3;
 const MAX_PROPERTY_RETRIES = 2;
@@ -159,9 +164,25 @@ function buildNotionProps(data) {
   return props;
 }
 
-// ── JSON Report Output ───────────────────────────────────
-function report(obj) {
-  console.log(JSON.stringify(obj));
+// ── Report: stdout JSON + Slack ──────────────────────────
+async function report(obj) {
+  const json = JSON.stringify(obj);
+  console.log(json);
+
+  if (!slack) {
+    console.error("SLACK_BOT_TOKEN未設定 - Slack通知スキップ");
+    return;
+  }
+
+  try {
+    await slack.chat.postMessage({
+      channel: SLACK_CHANNEL,
+      text: json,
+    });
+    console.error("Slack通知送信完了");
+  } catch (err) {
+    console.error(`Slack通知失敗: ${err.message}`);
+  }
 }
 
 // ── REINS Login with retry ───────────────────────────────
@@ -231,7 +252,7 @@ async function run(mode) {
   }
 
   if (targets.length === 0) {
-    report({
+    await report({
       agent: "reins-sync",
       status: "success",
       message: "新規物件なし",
@@ -252,7 +273,7 @@ async function run(mode) {
   const loginOk = await loginWithRetry(page);
   if (!loginOk) {
     await browser.close();
-    report({
+    await report({
       agent: "reins-sync",
       status: "error",
       reason: `REINSログインを${MAX_LOGIN_RETRIES}回試みましたが完了できませんでした`,
@@ -291,9 +312,9 @@ async function run(mode) {
 
   await browser.close();
 
-  // 5. Output JSON report
+  // 5. Output JSON report + Slack notify
   if (failedCount === 0) {
-    report({
+    await report({
       agent: "reins-sync",
       status: "success",
       total: allPages.length,
@@ -305,7 +326,7 @@ async function run(mode) {
       })),
     });
   } else {
-    report({
+    await report({
       agent: "reins-sync",
       status: successCount > 0 ? "partial" : "error",
       reason:
@@ -324,8 +345,8 @@ async function run(mode) {
 const args = process.argv.slice(2);
 const mode = args.includes("--all") ? "all" : args.includes("--test") ? "test" : "new";
 
-run(mode).catch((err) => {
-  report({
+run(mode).catch(async (err) => {
+  await report({
     agent: "reins-sync",
     status: "error",
     reason: err.message,
