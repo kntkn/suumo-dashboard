@@ -24,15 +24,11 @@ if (fs.existsSync(envPath)) {
 
 const { chromium } = require("playwright");
 const { Client: NotionClient } = require("@notionhq/client");
-const { WebClient } = require("@slack/web-api");
 const reins = require("../skills/reins");
 
 const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
 const DB_ID = process.env.NOTION_DATABASE_ID;
-const slack = process.env.SLACK_BOT_TOKEN
-  ? new WebClient(process.env.SLACK_BOT_TOKEN)
-  : null;
-const SLACK_CHANNEL = process.env.SLACK_REPORT_CHANNEL || "ex_fango";
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 
 const MAX_LOGIN_RETRIES = 3;
 const MAX_PROPERTY_RETRIES = 2;
@@ -164,22 +160,27 @@ function buildNotionProps(data) {
   return props;
 }
 
-// ── Report: stdout JSON + Slack ──────────────────────────
+// ── Report: stdout JSON + Slack Webhook ──────────────────
 async function report(obj) {
   const json = JSON.stringify(obj);
   console.log(json);
 
-  if (!slack) {
-    console.error("SLACK_BOT_TOKEN未設定 - Slack通知スキップ");
+  if (!SLACK_WEBHOOK_URL) {
+    console.error("SLACK_WEBHOOK_URL未設定 - Slack通知スキップ");
     return;
   }
 
   try {
-    await slack.chat.postMessage({
-      channel: SLACK_CHANNEL,
-      text: json,
+    const res = await fetch(SLACK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: json }),
     });
-    console.error("Slack通知送信完了");
+    if (res.ok) {
+      console.error("Slack通知送信完了");
+    } else {
+      console.error(`Slack通知失敗: ${res.status} ${await res.text()}`);
+    }
   } catch (err) {
     console.error(`Slack通知失敗: ${err.message}`);
   }
