@@ -92,11 +92,7 @@ function buildNotionProps(data) {
       props[key] = { number: value };
     }
   };
-  const setSelect = (key, value) => {
-    if (value) {
-      props[key] = { select: { name: String(value) } };
-    }
-  };
+
 
   const rent = parseRent(data.賃料);
   setNum("価格_賃料(万)", rent);
@@ -135,10 +131,8 @@ function buildNotionProps(data) {
   setNum("築年", parseYear(data.築年月));
   setText("建物_構造", data.建物構造);
 
-  const floorTotal = parseFloor(data.地上階層);
-  if (floorTotal) setSelect("建物_地上階層", `${floorTotal}階`);
-  const floorAt = parseFloor(data.所在階);
-  if (floorAt) setSelect("建物_所在階", `${floorAt}階`);
+  setNum("建物_地上階層", parseFloor(data.地上階層) ? parseInt(parseFloor(data.地上階層)) : null);
+  setNum("建物_所在階", parseFloor(data.所在階) ? parseInt(parseFloor(data.所在階)) : null);
 
   setText("建物_バルコニー方向", data.バルコニー方向);
 
@@ -233,13 +227,24 @@ async function processProperty(page, reinsId) {
 
 // ── Main ─────────────────────────────────────────────────
 async function run(mode) {
-  // 1. Fetch all Notion pages
-  const db = await notion.databases.query({ database_id: DB_ID, page_size: 100 });
-  const allPages = db.results.map((p) => ({
-    pageId: p.id,
-    reinsId: p.properties.REINS_ID?.title?.[0]?.plain_text || "",
-    hasData: p.properties["賃料"]?.number != null,
-  }));
+  // 1. Fetch all Notion pages (with pagination)
+  const allPages = [];
+  let cursor = undefined;
+  do {
+    const db = await notion.databases.query({
+      database_id: DB_ID,
+      page_size: 100,
+      ...(cursor && { start_cursor: cursor }),
+    });
+    for (const p of db.results) {
+      allPages.push({
+        pageId: p.id,
+        reinsId: p.properties.REINS_ID?.title?.[0]?.plain_text || "",
+        hasData: p.properties["賃料"]?.number != null,
+      });
+    }
+    cursor = db.has_more ? db.next_cursor : undefined;
+  } while (cursor);
 
   // 2. Filter: new properties only (unless --all)
   let targets;
@@ -257,7 +262,7 @@ async function run(mode) {
       agent: "reins-sync",
       status: "success",
       synced: 0,
-      total_in_db: allPages.length,
+      total: allPages.length,
     });
     return;
   }
@@ -283,8 +288,7 @@ async function run(mode) {
   }
 
   // 4. Process each property
-  const synced = [];
-  const notFound = [];
+  let syncCount = 0;
   const errors = [];
 
   for (let i = 0; i < targets.length; i++) {
@@ -296,13 +300,11 @@ async function run(mode) {
     if (result.status === "ok") {
       const notionProps = buildNotionProps(result.data);
       await notion.pages.update({ page_id: pageId, properties: notionProps });
-      const building = result.data.建物名 || "";
-      const rent = result.data.賃料 || "";
-      console.error(`  -> ${building} / ${rent}`);
-      synced.push({ reinsId, building, rent });
+      console.error(`  -> ${result.data.建物名 || ""} / ${result.data.賃料 || ""}`);
+      syncCount++;
     } else if (result.status === "not_found") {
-      console.error(`  -> not_found`);
-      notFound.push(reinsId);
+      console.error(`  -> not_found → Notionから削除`);
+      await notion.pages.update({ page_id: pageId, archived: true });
     } else {
       console.error(`  -> error: ${result.error}`);
       errors.push({ reinsId, error: result.error });
@@ -317,14 +319,10 @@ async function run(mode) {
   const r = {
     agent: "reins-sync",
     status: errors.length > 0 ? "error" : "success",
-    synced: synced.length,
-    not_found: notFound.length,
-    errors: errors.length,
-    total_in_db: allPages.length,
+    synced: syncCount,
+    total: allPages.length,
   };
-  if (synced.length > 0) r.synced_properties = synced;
-  if (notFound.length > 0) r.not_found_ids = notFound;
-  if (errors.length > 0) r.error_details = errors;
+  if (errors.length > 0) r.errors = errors;
 
   await report(r);
 }
