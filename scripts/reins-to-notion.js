@@ -97,7 +97,8 @@ function buildNotionProps(data) {
   const rent = parseRent(data.賃料);
   setNum("価格_賃料(万)", rent);
   setNum("賃料", rent);
-  setNum("管理費(万)", parseYen(data.共益費));
+  setNum("管理費(万)", parseYen(data.管理費));
+  setNum("共益費(万)", parseYen(data.共益費));
   setNum("敷金(ヶ月)", parseMonths(data.敷金));
   setNum("礼金(ヶ月)", parseMonths(data.礼金));
 

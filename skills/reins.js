@@ -135,7 +135,8 @@ async function extractPropertyData(page) {
       地下階層: /地下階層\s*\n\s*(\S+)/,
       所在階: /所在階\s*\n\s*(\S+)/,
       バルコニー方向: /バルコニー方向\s*\n\s*(\S+)/,
-      共益費: /共益費\s*\n\s*([\d,]+円)/,
+      管理費: /管理費\s*\n\s*([^\n]+)/,
+      共益費: /共益費\s*\n\s*([^\n]+)/,
       更新料: /更新料\s*\n\s*([^\n]+)/,
       駐車場在否: /駐車場在否\s*\n\s*(\S+)/,
       現況: /現況\s*\n\s*(\S+)/,
@@ -212,8 +213,8 @@ async function extractImageData(page) {
   }));
 }
 
-// ── Download Images via Authenticated Session ──────────────
-async function downloadImages(page, images, downloadDir) {
+// ── Screenshot All Images (white frame clip) ───────────────
+async function screenshotAllImages(page, imageCount, downloadDir) {
   const fs = require("fs");
   const path = require("path");
 
@@ -222,27 +223,42 @@ async function downloadImages(page, images, downloadDir) {
   }
 
   const downloaded = [];
-  for (const img of images) {
-    if (!img.fullUrl) continue;
+  const cards = await page.$$(REINS_SELECTORS.detail.imageCard);
+  const count = Math.min(imageCount, cards.length);
 
+  for (let i = 0; i < count; i++) {
     try {
-      const response = await page.evaluate(async (url) => {
-        const res = await fetch(url);
-        const blob = await res.blob();
-        const reader = new FileReader();
-        return new Promise((resolve) => {
-          reader.onloadend = () => resolve(reader.result);
-          reader.readAsDataURL(blob);
-        });
-      }, img.fullUrl);
+      // Click image card to open modal popup
+      const link = await cards[i].$("a");
+      if (!link) continue;
+      await link.click();
+      await page.waitForTimeout(2000);
 
-      // Convert base64 data URL to buffer
-      const base64Data = response.replace(/^data:image\/\w+;base64,/, "");
-      const filePath = path.join(downloadDir, `reins_${img.index}.jpg`);
-      fs.writeFileSync(filePath, Buffer.from(base64Data, "base64"));
-      downloaded.push({ ...img, localPath: filePath });
+      // Screenshot the white rectangular frame area
+      const filePath = path.join(downloadDir, `reins_${i + 1}.jpg`);
+      await page.screenshot({
+        type: "jpeg",
+        quality: 90,
+        clip: REINS_SELECTORS.imagePopup.clip,
+        path: filePath,
+      });
+
+      downloaded.push({ index: i + 1, localPath: filePath });
+
+      // Close modal
+      const closeBtn = await page.$('.modal.show button:has-text("閉じる")');
+      if (closeBtn) {
+        await closeBtn.click();
+        await page.waitForTimeout(800);
+      }
     } catch (err) {
-      console.error(`Failed to download image ${img.index}:`, err.message);
+      console.error(`Failed to screenshot image ${i + 1}:`, err.message);
+      // Try to close modal if still open
+      try {
+        const closeBtn = await page.$('.modal.show button:has-text("閉じる")');
+        if (closeBtn) await closeBtn.click();
+        await page.waitForTimeout(500);
+      } catch {}
     }
   }
 
@@ -281,6 +297,5 @@ module.exports = {
   searchByNumber,
   extractPropertyData,
   extractImageData,
-  downloadImages,
-  screenshotImagePopup,
+  screenshotAllImages,
 };
