@@ -1,291 +1,128 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { io } from "socket.io-client";
 import { motion, AnimatePresence } from "framer-motion";
 
-const TOTAL_SLOTS = 6;
+const STEPS = [
+  { label: "REINS ログイン", icon: "key" },
+  { label: "データ抽出", icon: "search" },
+  { label: "画像ダウンロード", icon: "image" },
+  { label: "AI 画像処理", icon: "sparkle" },
+  { label: "AI テキスト生成", icon: "text" },
+  { label: "forrent.jp 入稿", icon: "upload" },
+  { label: "スコア確認", icon: "chart" },
+];
 
-// ══════════════════════════════════════════════════════════
-//  MAIN DASHBOARD
-// ══════════════════════════════════════════════════════════
-export default function Dashboard() {
+export default function NyukoPage() {
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
-  const [activeTab, setActiveTab] = useState("placement");
-  const [properties, setProperties] = useState([]);
-  const [loadingProps, setLoadingProps] = useState(true);
-  const [slots, setSlots] = useState(
-    Array.from({ length: TOTAL_SLOTS }, (_, i) => ({
-      id: i + 1,
-      status: "empty",
-      property: null,
-    }))
+  const [phase, setPhase] = useState("input"); // "input" | "running" | "done"
+  const [reinsId, setReinsId] = useState("");
+  const [steps, setSteps] = useState(
+    STEPS.map((s) => ({ ...s, status: "pending", detail: "" }))
   );
+  const [result, setResult] = useState(null);
+  const [errorMsg, setErrorMsg] = useState("");
 
-  // Browser & automation state
-  const [browserFrame, setBrowserFrame] = useState(null);
-  const [browserUrl, setBrowserUrl] = useState("");
-  const [placementStatus, setPlacementStatus] = useState(null);
-  const [bukakuStatus, setBukakuStatus] = useState(null);
-  const [isAutomating, setIsAutomating] = useState(false);
-  const [automatingPropertyId, setAutomatingPropertyId] = useState(null);
-  const [statusLog, setStatusLog] = useState([]);
-  const lastActivityRef = useRef(Date.now());
-
-  // ── Watchdog: auto-reset if no activity for 25s ────────
-  useEffect(() => {
-    if (!isAutomating) return;
-    const watchdog = setInterval(() => {
-      if (Date.now() - lastActivityRef.current > 25000) {
-        setIsAutomating(false);
-        setAutomatingPropertyId(null);
-        setPlacementStatus((prev) =>
-          prev?.phase !== "complete"
-            ? { phase: "error", message: "応答なし - 自動リセットしました" }
-            : prev
-        );
-      }
-    }, 3000);
-    return () => clearInterval(watchdog);
-  }, [isAutomating]);
-
-  // ── Socket.io ──────────────────────────────────────────
+  // ── Socket.io ──
   useEffect(() => {
     const s = io(window.location.origin, { reconnection: true });
-
     s.on("connect", () => setConnected(true));
     s.on("disconnect", () => setConnected(false));
 
-    s.on("browser-frame", (data) => {
-      setBrowserFrame(data.image);
-      setBrowserUrl(data.url || "");
-      lastActivityRef.current = Date.now();
+    s.on("step-update", ({ stepIndex, status, detail }) => {
+      setSteps((prev) =>
+        prev.map((step, i) =>
+          i === stepIndex ? { ...step, status, detail: detail || step.detail } : step
+        )
+      );
     });
 
-    s.on("slots-update", (data) => setSlots(data));
-
-    s.on("placement-status", (data) => {
-      setPlacementStatus(data);
-      lastActivityRef.current = Date.now();
-      setStatusLog((prev) => [
-        { time: new Date(), ...data },
-        ...prev.slice(0, 30),
-      ]);
-      if (data.phase === "complete" || data.phase === "error") {
-        setTimeout(() => {
-          setIsAutomating(false);
-          setAutomatingPropertyId(null);
-        }, 3000);
-      }
+    s.on("done", (data) => {
+      setResult(data);
+      setPhase("done");
     });
 
-    s.on("bukaku-status", (data) => {
-      setBukakuStatus(data);
-      lastActivityRef.current = Date.now();
-      setStatusLog((prev) => [
-        { time: new Date(), type: "bukaku", ...data },
-        ...prev.slice(0, 30),
-      ]);
-      if (
-        data.phase === "confirmed" ||
-        data.phase === "removed" ||
-        data.phase === "error"
-      ) {
-        setTimeout(() => {
-          setIsAutomating(false);
-          setBukakuStatus(null);
-        }, 3000);
-      }
+    s.on("error", ({ message }) => {
+      setErrorMsg(message);
+      setPhase("done");
     });
 
     setSocket(s);
     return () => s.disconnect();
   }, []);
 
-  // ── Fetch properties from Notion ───────────────────────
-  useEffect(() => {
-    fetch("/api/properties")
-      .then((r) => r.json())
-      .then((data) => {
-        setProperties(data);
-        setLoadingProps(false);
-      })
-      .catch(() => setLoadingProps(false));
+  // ── Start Automation ──
+  const handleStart = useCallback(() => {
+    if (!socket || !reinsId.trim()) return;
+    setPhase("running");
+    setErrorMsg("");
+    setResult(null);
+    setSteps(STEPS.map((s) => ({ ...s, status: "pending", detail: "" })));
+    socket.emit("start-nyuko", { reinsId: reinsId.trim() });
+  }, [socket, reinsId]);
+
+  // ── Reset ──
+  const handleReset = useCallback(() => {
+    setPhase("input");
+    setReinsId("");
+    setResult(null);
+    setErrorMsg("");
+    setSteps(STEPS.map((s) => ({ ...s, status: "pending", detail: "" })));
   }, []);
-
-  // ── Actions ────────────────────────────────────────────
-  const handleStartPlacement = useCallback(
-    (property) => {
-      if (!socket || isAutomating) return;
-      setIsAutomating(true);
-      setAutomatingPropertyId(property.id);
-      setBrowserFrame(null);
-      setPlacementStatus(null);
-      setStatusLog([]);
-      socket.emit("start-placement", { property });
-    },
-    [socket, isAutomating]
-  );
-
-  const handleStartBukaku = useCallback(
-    (slotId) => {
-      if (!socket || isAutomating) return;
-      setIsAutomating(true);
-      setBrowserFrame(null);
-      setBukakuStatus(null);
-      socket.emit("start-bukaku", { slotId });
-    },
-    [socket, isAutomating]
-  );
-
-  const handleStartBukakuAll = useCallback(() => {
-    if (!socket || isAutomating) return;
-    setIsAutomating(true);
-    setBrowserFrame(null);
-    setBukakuStatus(null);
-    socket.emit("start-bukaku-all");
-  }, [socket, isAutomating]);
-
-  const handleRemoveAd = useCallback(
-    (slotId) => {
-      if (!socket) return;
-      socket.emit("remove-ad", { slotId });
-    },
-    [socket]
-  );
-
-  const activeSlots = slots.filter((s) => s.status === "active").length;
 
   return (
     <div className="min-h-screen flex flex-col">
-      {/* ── Header ── */}
+      {/* Header */}
       <header className="glass border-b border-[var(--color-border)] px-6 py-4">
-        <div className="max-w-[1440px] mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-purple-700 flex items-center justify-center text-xs font-bold">
-                F
-              </div>
-              <div>
-                <h1 className="text-sm font-semibold tracking-tight">
-                  FANGO <span className="text-white/30 font-normal mx-1">×</span> SUUMO
-                </h1>
-                <p className="text-[10px] text-white/30 tracking-widest uppercase">
-                  AI Ad Manager
-                </p>
-              </div>
+        <div className="max-w-2xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-purple-700 flex items-center justify-center text-xs font-bold">
+              S
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold tracking-tight">
+                SUUMO Auto-Nyuko
+              </h1>
+              <p className="text-[10px] text-white/30 tracking-widest uppercase">
+                REINS to SUUMO Pipeline
+              </p>
             </div>
           </div>
-
-          {/* Slot Indicator */}
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              {slots.map((slot) => (
-                <div
-                  key={slot.id}
-                  className={`w-2.5 h-2.5 rounded-full transition-all duration-500 ${
-                    slot.status === "active"
-                      ? "bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.5)]"
-                      : "bg-white/10"
-                  }`}
-                />
-              ))}
-            </div>
-            <div className="text-xs text-white/40">
-              <span className="text-white font-medium">{activeSlots}</span>
-              <span className="mx-0.5">/</span>
-              <span>{TOTAL_SLOTS}</span>
-              <span className="ml-1.5">使用中</span>
-            </div>
-            <div
-              className={`w-1.5 h-1.5 rounded-full ${
-                connected ? "bg-emerald-400" : "bg-red-400"
-              }`}
-            />
-          </div>
+          <div
+            className={`w-1.5 h-1.5 rounded-full ${
+              connected ? "bg-emerald-400" : "bg-red-400"
+            }`}
+            title={connected ? "Connected" : "Disconnected"}
+          />
         </div>
       </header>
 
-      {/* ── Tab Navigation ── */}
-      <nav className="px-6 pt-5 pb-1">
-        <div className="max-w-[1440px] mx-auto">
-          <div className="relative inline-flex items-center bg-white/[0.03] rounded-xl p-1 border border-white/[0.06]">
-            {[
-              { key: "placement", label: "新規掲載" },
-              { key: "management", label: "掲載管理" },
-            ].map((tab) => (
-              <button
-                key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
-                className="relative z-10 px-8 py-2.5 rounded-[10px] text-[13px] font-medium"
-              >
-                {activeTab === tab.key && (
-                  <motion.div
-                    layoutId="tab-pill"
-                    className="absolute inset-0 rounded-[10px] bg-white/[0.08] border border-white/[0.10] shadow-[0_0_12px_rgba(255,255,255,0.02)]"
-                    transition={{ type: "spring", stiffness: 380, damping: 28 }}
-                  />
-                )}
-                <span
-                  className={`relative z-10 transition-colors duration-200 ${
-                    activeTab === tab.key
-                      ? "text-white"
-                      : "text-white/30 hover:text-white/50"
-                  }`}
-                >
-                  {tab.label}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-      </nav>
-
-      {/* ── Content ── */}
-      <main className="flex-1 px-6 py-5">
-        <div className="max-w-[1440px] mx-auto">
+      {/* Main */}
+      <main className="flex-1 px-6 py-10">
+        <div className="max-w-2xl mx-auto">
           <AnimatePresence mode="wait">
-            {activeTab === "placement" ? (
-              <motion.div
-                key="placement"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.2 }}
-              >
-                <PlacementTab
-                  properties={properties}
-                  loadingProps={loadingProps}
-                  slots={slots}
-                  browserFrame={browserFrame}
-                  browserUrl={browserUrl}
-                  placementStatus={placementStatus}
-                  isAutomating={isAutomating}
-                  automatingPropertyId={automatingPropertyId}
-                  statusLog={statusLog}
-                  onStartPlacement={handleStartPlacement}
-                />
-              </motion.div>
-            ) : (
-              <motion.div
-                key="management"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.2 }}
-              >
-                <ManagementTab
-                  slots={slots}
-                  browserFrame={browserFrame}
-                  browserUrl={browserUrl}
-                  bukakuStatus={bukakuStatus}
-                  isAutomating={isAutomating}
-                  onStartBukaku={handleStartBukaku}
-                  onStartBukakuAll={handleStartBukakuAll}
-                  onRemoveAd={handleRemoveAd}
-                />
-              </motion.div>
+            {phase === "input" && (
+              <InputPhase
+                key="input"
+                reinsId={reinsId}
+                setReinsId={setReinsId}
+                onStart={handleStart}
+                connected={connected}
+              />
+            )}
+            {phase === "running" && (
+              <RunningPhase key="running" steps={steps} reinsId={reinsId} />
+            )}
+            {phase === "done" && (
+              <DonePhase
+                key="done"
+                result={result}
+                errorMsg={errorMsg}
+                reinsId={reinsId}
+                onReset={handleReset}
+              />
             )}
           </AnimatePresence>
         </div>
@@ -295,462 +132,363 @@ export default function Dashboard() {
 }
 
 // ══════════════════════════════════════════════════════════
-//  ① PLACEMENT TAB
+//  INPUT PHASE
 // ══════════════════════════════════════════════════════════
-function PlacementTab({
-  properties,
-  loadingProps,
-  slots,
-  browserFrame,
-  browserUrl,
-  placementStatus,
-  isAutomating,
-  automatingPropertyId,
-  statusLog,
-  onStartPlacement,
-}) {
-  const emptySlots = slots.filter((s) => s.status === "empty").length;
-
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-[420px_1fr] gap-5">
-      {/* Left: Property List */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between mb-1">
-          <h2 className="text-sm font-medium text-white/60">
-            新着物件
-            <span className="ml-2 text-white/30">(Notion連携)</span>
-          </h2>
-          <span className="text-xs text-white/30">
-            空き枠: {emptySlots}/{TOTAL_SLOTS}
-          </span>
-        </div>
-
-        <div className="space-y-2 max-h-[calc(100vh-220px)] overflow-y-auto pr-1">
-          {loadingProps ? (
-            Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="glass rounded-xl p-4 animate-shimmer h-28" />
-            ))
-          ) : (
-            properties.map((prop, idx) => (
-              <PropertyCard
-                key={prop.id}
-                property={prop}
-                index={idx}
-                isAutomating={isAutomating}
-                isCurrentTarget={automatingPropertyId === prop.id}
-                emptySlots={emptySlots}
-                onStart={onStartPlacement}
-              />
-            ))
-          )}
-        </div>
-      </div>
-
-      {/* Right: Browser View + Status */}
-      <div className="space-y-3">
-        <BrowserView
-          frame={browserFrame}
-          url={browserUrl}
-          isAutomating={isAutomating}
-          status={placementStatus}
-        />
-        {statusLog.length > 0 && (
-          <StatusLog entries={statusLog} />
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════
-//  ② MANAGEMENT TAB
-// ══════════════════════════════════════════════════════════
-function ManagementTab({
-  slots,
-  browserFrame,
-  browserUrl,
-  bukakuStatus,
-  isAutomating,
-  onStartBukaku,
-  onStartBukakuAll,
-  onRemoveAd,
-}) {
-  const activeSlots = slots.filter((s) => s.status === "active");
-
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-[1fr_480px] gap-5">
-      {/* Left: Ad Slots */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between mb-1">
-          <h2 className="text-sm font-medium text-white/60">
-            掲載中の広告
-            <span className="ml-2 text-white/30">({activeSlots.length}件)</span>
-          </h2>
-          <button
-            onClick={onStartBukakuAll}
-            disabled={isAutomating || activeSlots.length === 0}
-            className="text-xs px-3 py-1.5 rounded-lg bg-violet-500/15 text-violet-400
-                       hover:bg-violet-500/25 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            全件物確を実行
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {slots.map((slot) => (
-            <AdSlotCard
-              key={slot.id}
-              slot={slot}
-              bukakuStatus={bukakuStatus}
-              isAutomating={isAutomating}
-              onStartBukaku={onStartBukaku}
-              onRemoveAd={onRemoveAd}
-            />
-          ))}
-        </div>
-      </div>
-
-      {/* Right: Browser View for Bukaku */}
-      <div>
-        <BrowserView
-          frame={browserFrame}
-          url={browserUrl}
-          isAutomating={isAutomating}
-          status={
-            bukakuStatus
-              ? { phase: bukakuStatus.phase, message: bukakuStatus.message }
-              : null
-          }
-        />
-      </div>
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════
-//  COMPONENTS
-// ══════════════════════════════════════════════════════════
-
-// ── Property Card ────────────────────────────────────────
-function PropertyCard({
-  property,
-  index,
-  isAutomating,
-  isCurrentTarget,
-  emptySlots,
-  onStart,
-}) {
-  const p = property;
-  const responseLevel =
-    p.predictedResponses >= 6.0
-      ? "top"
-      : p.predictedResponses >= 4.0
-        ? "high"
-        : "mid";
+function InputPhase({ reinsId, setReinsId, onStart, connected }) {
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && reinsId.trim()) onStart();
+  };
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 10 }}
+      initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: index * 0.04 }}
-      className={`glass rounded-xl p-4 glass-hover transition-all duration-200 group ${
-        isCurrentTarget ? "glow-accent border-violet-500/30" : ""
-      }`}
+      exit={{ opacity: 0, y: -12 }}
+      className="flex flex-col items-center gap-8"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          {/* Station & Line */}
-          <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-sm font-semibold">{p.station}</span>
-            <span className="text-xs text-white/30">
-              {p.line} 徒歩{p.walk}
-            </span>
-          </div>
-
-          {/* Details */}
-          <div className="flex items-center gap-3 text-xs text-white/50 mb-2.5">
-            <span className="font-medium text-white/80">{p.rent}</span>
-            <span>{p.area}</span>
-            <span>{p.structure}</span>
-            <span>{p.age}</span>
-          </div>
-
-          {/* Address */}
-          <p className="text-[11px] text-white/25 truncate">{p.address}</p>
-
-          {/* Predicted views */}
-          <div className="mt-2.5 flex items-center gap-1.5">
-            {responseLevel === "top" && (
-              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 leading-none mr-0.5">
-                HOT
-              </span>
-            )}
-            <span
-              className={`text-base font-bold tabular-nums leading-none ${
-                responseLevel === "top"
-                  ? "text-violet-300"
-                  : responseLevel === "high"
-                    ? "text-emerald-400"
-                    : "text-amber-400"
-              }`}
-            >
-              {p.predictedResponses.toFixed(1)}
-            </span>
-            <span className="text-[10px] text-white/25 leading-none">
-              views/day
-            </span>
-          </div>
-        </div>
-
-        {/* Action */}
-        <button
-          onClick={() => onStart(p)}
-          disabled={isAutomating || emptySlots === 0}
-          className={`mt-1 shrink-0 text-xs px-3 py-2 rounded-lg font-medium transition-all duration-200
-            ${
-              isCurrentTarget
-                ? "bg-violet-500 text-white animate-pulse"
-                : "bg-white/5 text-white/40 hover:bg-violet-500/20 hover:text-violet-300 group-hover:text-white/60"
-            }
-            disabled:opacity-20 disabled:cursor-not-allowed`}
-        >
-          {isCurrentTarget ? "処理中..." : "掲載開始"}
-        </button>
+      <div className="text-center">
+        <h2 className="text-2xl font-semibold tracking-tight mb-2">
+          REINS 物件番号を入力
+        </h2>
+        <p className="text-sm text-white/40">
+          物件番号から自動でSUUMO入稿を行います
+        </p>
       </div>
 
-      {/* REINS ID */}
-      <div className="mt-2 flex items-center gap-1.5">
-        <span className="text-[10px] text-white/15 font-mono">
-          REINS {p.reinsId}
-        </span>
-      </div>
-    </motion.div>
-  );
-}
-
-// ── Browser View ─────────────────────────────────────────
-function BrowserView({ frame, url, isAutomating, status }) {
-  return (
-    <div className="glass rounded-xl overflow-hidden">
-      {/* Chrome bar */}
-      <div className="browser-chrome px-4 py-2.5 flex items-center gap-3 border-b border-white/5">
-        <div className="flex gap-1.5">
-          <div className="w-2.5 h-2.5 rounded-full bg-white/10" />
-          <div className="w-2.5 h-2.5 rounded-full bg-white/10" />
-          <div className="w-2.5 h-2.5 rounded-full bg-white/10" />
-        </div>
-        <div className="flex-1 mx-2">
-          <div className="bg-white/5 rounded-md px-3 py-1 text-[11px] text-white/30 truncate">
-            {url || "about:blank"}
-          </div>
-        </div>
-        {isAutomating && (
-          <div className="flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
-            <span className="text-[10px] text-violet-400">AI操作中</span>
-          </div>
-        )}
-      </div>
-
-      {/* Viewport */}
-      <div className="relative aspect-[16/10] bg-black/40">
-        {frame ? (
-          <img
-            src={frame}
-            alt="Browser"
-            className="w-full h-full object-cover object-top"
-          />
-        ) : (
-          <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <div className="w-12 h-12 rounded-2xl bg-white/3 flex items-center justify-center mb-3">
-              <svg
-                className="w-6 h-6 text-white/15"
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.2}
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5a17.92 17.92 0 01-8.716-2.247m0 0A9.015 9.015 0 003 12c0-1.605.42-3.113 1.157-4.418"
-                />
-              </svg>
-            </div>
-            <p className="text-xs text-white/20">
-              掲載開始ボタンを押すとブラウザが表示されます
-            </p>
-          </div>
-        )}
-
-        {/* Scan line effect during automation */}
-        {isAutomating && frame && (
-          <div
-            className="absolute left-0 right-0 h-px bg-gradient-to-r from-transparent via-violet-400/40 to-transparent"
-            style={{ animation: "scan-line 2s linear infinite" }}
-          />
-        )}
-      </div>
-
-      {/* Status bar */}
-      {status && (
-        <div className="px-4 py-2.5 border-t border-white/5 flex items-center gap-3">
-          {status.phase === "complete" ? (
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          ) : status.phase === "error" ? (
-            <div className="w-1.5 h-1.5 rounded-full bg-red-400" />
-          ) : (
-            <div className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
-          )}
-          <span className="text-xs text-white/50">{status.message}</span>
-          {status.step && status.total && (
-            <span className="ml-auto text-[10px] text-white/20">
-              Step {status.step}/{status.total}
-            </span>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Ad Slot Card ─────────────────────────────────────────
-function AdSlotCard({
-  slot,
-  bukakuStatus,
-  isAutomating,
-  onStartBukaku,
-  onRemoveAd,
-}) {
-  const isActive = slot.status === "active";
-  const isBukakuTarget = bukakuStatus?.slotId === slot.id;
-  const p = slot.property;
-
-  const bukakuColor =
-    slot.bukakuResult === "空室確認済"
-      ? "text-emerald-400"
-      : slot.bukakuResult === "成約済"
-        ? "text-red-400"
-        : "text-white/30";
-
-  return (
-    <motion.div
-      layout
-      className={`glass rounded-xl p-4 transition-all duration-300 ${
-        isActive ? "" : "opacity-40"
-      } ${isBukakuTarget ? "glow-accent border-violet-500/30" : ""}`}
-    >
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <div
-            className={`w-2 h-2 rounded-full ${
-              isActive ? "bg-emerald-400" : "bg-white/10"
-            }`}
-          />
-          <span className="text-xs text-white/40">
-            スロット {slot.id}
-          </span>
-        </div>
-        {isActive && (
-          <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400">
-            掲載中
-          </span>
-        )}
-      </div>
-
-      {isActive && p ? (
-        <>
-          <div className="mb-2">
-            <p className="text-sm font-medium">{p.station}</p>
-            <p className="text-xs text-white/40 mt-0.5">
-              {p.line} 徒歩{p.walk} | {p.rent}
-            </p>
-            <p className="text-[11px] text-white/20 mt-0.5 truncate">
-              {p.address}
-            </p>
-          </div>
-
-          {/* Bukaku status */}
-          <div className="mt-3 pt-3 border-t border-white/5">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[10px] text-white/30">物確ステータス</span>
-              <span className={`text-[11px] font-medium ${bukakuColor}`}>
-                {slot.bukakuResult || "未確認"}
-              </span>
-            </div>
-            {slot.lastBukaku && (
-              <p className="text-[10px] text-white/20">
-                最終確認:{" "}
-                {new Date(slot.lastBukaku).toLocaleString("ja-JP", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </p>
-            )}
-          </div>
-
-          {/* Actions */}
-          <div className="mt-3 flex gap-2">
+      <div className="w-full max-w-md">
+        <div className="glass rounded-xl p-6 glow-accent">
+          <label className="block text-xs text-white/40 mb-2 font-medium">
+            物件番号
+          </label>
+          <div className="flex gap-3">
+            <input
+              type="text"
+              value={reinsId}
+              onChange={(e) => setReinsId(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="例: 012345678901"
+              autoFocus
+              className="flex-1 bg-white/5 border border-white/10 rounded-lg px-4 py-3
+                         text-white placeholder-white/20 text-sm font-mono
+                         focus:outline-none focus:border-violet-500/50 focus:ring-1 focus:ring-violet-500/20
+                         transition-all"
+            />
             <button
-              onClick={() => onStartBukaku(slot.id)}
-              disabled={isAutomating}
-              className="flex-1 text-[11px] py-1.5 rounded-lg bg-white/5 text-white/40
-                         hover:bg-violet-500/15 hover:text-violet-400 transition-all
-                         disabled:opacity-30 disabled:cursor-not-allowed"
+              onClick={onStart}
+              disabled={!reinsId.trim() || !connected}
+              className="px-6 py-3 rounded-lg bg-violet-600 text-white text-sm font-medium
+                         hover:bg-violet-500 transition-all
+                         disabled:opacity-30 disabled:cursor-not-allowed
+                         active:scale-95"
             >
-              {isBukakuTarget ? "確認中..." : "物確実行"}
-            </button>
-            <button
-              onClick={() => onRemoveAd(slot.id)}
-              disabled={isAutomating}
-              className="flex-1 text-[11px] py-1.5 rounded-lg bg-white/5 text-white/40
-                         hover:bg-red-500/15 hover:text-red-400 transition-all
-                         disabled:opacity-30 disabled:cursor-not-allowed"
-            >
-              取り下げ
+              入稿開始
             </button>
           </div>
-        </>
-      ) : (
-        <div className="py-6 text-center">
-          <p className="text-xs text-white/15">空き枠</p>
         </div>
-      )}
-    </motion.div>
-  );
-}
+      </div>
 
-// ── Status Log ───────────────────────────────────────────
-function StatusLog({ entries }) {
-  return (
-    <div className="glass rounded-xl p-3 max-h-44 overflow-y-auto">
-      <p className="text-[10px] text-white/30 mb-2 uppercase tracking-wider">
-        Activity Log
-      </p>
-      <div className="space-y-1.5">
-        {entries.map((e, i) => (
-          <div key={i} className="flex items-start gap-2 text-[11px]">
-            <span className="text-white/15 tabular-nums shrink-0">
-              {new Date(e.time).toLocaleTimeString("ja-JP", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })}
-            </span>
-            <span
-              className={`${
-                e.phase === "error"
-                  ? "text-red-400/70"
-                  : e.phase === "complete" || e.phase === "confirmed"
-                    ? "text-emerald-400/70"
-                    : "text-white/40"
-              }`}
-            >
-              {e.message}
-            </span>
+      {/* Quick info */}
+      <div className="grid grid-cols-3 gap-4 w-full max-w-md">
+        {[
+          { label: "REINS", desc: "データ取得" },
+          { label: "AI", desc: "画像分析・テキスト生成" },
+          { label: "SUUMO", desc: "自動入稿" },
+        ].map((item) => (
+          <div
+            key={item.label}
+            className="glass rounded-lg p-3 text-center"
+          >
+            <p className="text-xs font-medium text-white/60">{item.label}</p>
+            <p className="text-[10px] text-white/25 mt-0.5">{item.desc}</p>
           </div>
         ))}
       </div>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  RUNNING PHASE
+// ══════════════════════════════════════════════════════════
+function RunningPhase({ steps, reinsId }) {
+  const currentStep = steps.findIndex((s) => s.status === "running");
+  const completedCount = steps.filter((s) => s.status === "done").length;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -12 }}
+      className="flex flex-col items-center gap-6"
+    >
+      <div className="text-center">
+        <h2 className="text-lg font-semibold tracking-tight mb-1">
+          入稿処理中
+        </h2>
+        <p className="text-xs text-white/30 font-mono">{reinsId}</p>
+      </div>
+
+      {/* Progress bar */}
+      <div className="w-full max-w-md">
+        <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+          <motion.div
+            className="h-full bg-gradient-to-r from-violet-600 to-violet-400 rounded-full"
+            initial={{ width: 0 }}
+            animate={{ width: `${((completedCount + 0.5) / steps.length) * 100}%` }}
+            transition={{ duration: 0.5, ease: "easeOut" }}
+          />
+        </div>
+        <div className="flex justify-between mt-1.5">
+          <span className="text-[10px] text-white/20">
+            Step {completedCount + 1} / {steps.length}
+          </span>
+          <span className="text-[10px] text-white/20">
+            {Math.round(((completedCount + 0.5) / steps.length) * 100)}%
+          </span>
+        </div>
+      </div>
+
+      {/* Steps list */}
+      <div className="w-full max-w-md space-y-2">
+        {steps.map((step, i) => (
+          <motion.div
+            key={i}
+            initial={{ opacity: 0, x: -8 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ delay: i * 0.05 }}
+            className={`glass rounded-lg px-4 py-3 flex items-center gap-3 transition-all duration-300 ${
+              step.status === "running" ? "glow-accent border-violet-500/30" : ""
+            }`}
+          >
+            <StepIcon status={step.status} />
+            <div className="flex-1 min-w-0">
+              <p
+                className={`text-sm ${
+                  step.status === "running"
+                    ? "text-white"
+                    : step.status === "done"
+                      ? "text-white/60"
+                      : "text-white/25"
+                }`}
+              >
+                {step.label}
+              </p>
+              {step.detail && (
+                <p className="text-[11px] text-white/30 truncate mt-0.5">
+                  {step.detail}
+                </p>
+              )}
+            </div>
+            <span className="text-[10px] text-white/15 tabular-nums shrink-0">
+              {i + 1}/{steps.length}
+            </span>
+          </motion.div>
+        ))}
+      </div>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  DONE PHASE
+// ══════════════════════════════════════════════════════════
+function DonePhase({ result, errorMsg, reinsId, onReset }) {
+  if (errorMsg) {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -12 }}
+        className="flex flex-col items-center gap-6"
+      >
+        <div className="w-full max-w-md glass rounded-xl p-6 glow-danger border-red-500/20">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+              <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-red-400">
+                エラーが発生しました
+              </h3>
+              <p className="text-xs text-white/30 font-mono">{reinsId}</p>
+            </div>
+          </div>
+          <p className="text-sm text-white/60">{errorMsg}</p>
+        </div>
+        <button onClick={onReset} className="text-sm text-violet-400 hover:text-violet-300 transition-colors">
+          最初からやり直す
+        </button>
+      </motion.div>
+    );
+  }
+
+  if (!result) return null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -12 }}
+      className="flex flex-col items-center gap-6"
+    >
+      {/* Score header */}
+      <div className="w-full max-w-md glass rounded-xl p-6 glow-success border-emerald-500/20">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-sm font-semibold text-emerald-400">
+              入稿完了
+            </h3>
+            <p className="text-xs text-white/30 mt-0.5">
+              {result.propertyName || reinsId}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="text-3xl font-bold tabular-nums text-white">
+              {result.score}
+              <span className="text-sm text-white/30 font-normal ml-1">/ 43</span>
+            </p>
+            <p className="text-[10px] text-white/25">名寄せスコア</p>
+          </div>
+        </div>
+
+        {/* Score bar */}
+        <div className="h-2 bg-white/5 rounded-full overflow-hidden mb-4">
+          <div
+            className={`h-full rounded-full transition-all ${
+              result.score >= 40
+                ? "bg-emerald-500"
+                : result.score >= 30
+                  ? "bg-amber-500"
+                  : "bg-red-500"
+            }`}
+            style={{ width: `${(result.score / 43) * 100}%` }}
+          />
+        </div>
+
+        {/* Summary */}
+        <div className="grid grid-cols-2 gap-3 text-xs">
+          <div className="bg-white/3 rounded-lg p-2.5">
+            <p className="text-white/30 mb-1">入力フィールド</p>
+            <p className="text-white font-medium">{result.filledFields}件</p>
+          </div>
+          <div className="bg-white/3 rounded-lg p-2.5">
+            <p className="text-white/30 mb-1">アップロード画像</p>
+            <p className="text-white font-medium">{result.uploadedImages}枚</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Score breakdown */}
+      {result.breakdown && Object.keys(result.breakdown).length > 0 && (
+        <div className="w-full max-w-md glass rounded-xl p-4">
+          <h4 className="text-xs text-white/40 mb-3 font-medium">
+            スコア内訳
+          </h4>
+          <div className="space-y-2">
+            {Object.entries(result.breakdown).map(([key, pts]) => (
+              <div key={key} className="flex items-center justify-between text-xs">
+                <span className="text-white/50">{key}</span>
+                <span className={pts > 0 ? "text-emerald-400" : "text-white/20"}>
+                  {pts}点
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Generated texts */}
+      {(result.catchCopy || result.comment) && (
+        <div className="w-full max-w-md glass rounded-xl p-4">
+          <h4 className="text-xs text-white/40 mb-3 font-medium">
+            AI生成テキスト
+          </h4>
+          {result.catchCopy && (
+            <div className="mb-3">
+              <p className="text-[10px] text-white/25 mb-1">キャッチコピー</p>
+              <p className="text-sm text-white/80 bg-white/3 rounded-lg p-2.5">
+                {result.catchCopy}
+              </p>
+            </div>
+          )}
+          {result.comment && (
+            <div>
+              <p className="text-[10px] text-white/25 mb-1">フリーコメント</p>
+              <p className="text-xs text-white/60 bg-white/3 rounded-lg p-2.5 leading-relaxed">
+                {result.comment}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Errors */}
+      {result.errors?.length > 0 && (
+        <div className="w-full max-w-md glass rounded-xl p-4 border-amber-500/10">
+          <h4 className="text-xs text-amber-400/70 mb-2 font-medium">
+            注意事項 ({result.errors.length}件)
+          </h4>
+          <div className="space-y-1">
+            {result.errors.map((err, i) => (
+              <p key={i} className="text-[11px] text-white/30">
+                {err}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Reset button */}
+      <button
+        onClick={onReset}
+        className="px-6 py-2.5 rounded-lg bg-violet-600 text-white text-sm font-medium
+                   hover:bg-violet-500 transition-all active:scale-95"
+      >
+        次の物件を入稿
+      </button>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  STEP ICON
+// ══════════════════════════════════════════════════════════
+function StepIcon({ status }) {
+  if (status === "done") {
+    return (
+      <div className="w-6 h-6 rounded-full bg-emerald-500/15 flex items-center justify-center shrink-0">
+        <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+        </svg>
+      </div>
+    );
+  }
+  if (status === "running") {
+    return (
+      <div className="w-6 h-6 rounded-full bg-violet-500/15 flex items-center justify-center shrink-0 relative">
+        <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse" />
+        <div
+          className="absolute inset-0 rounded-full border border-violet-400/30"
+          style={{ animation: "pulse-ring 1.5s ease-out infinite" }}
+        />
+      </div>
+    );
+  }
+  if (status === "error") {
+    return (
+      <div className="w-6 h-6 rounded-full bg-red-500/15 flex items-center justify-center shrink-0">
+        <svg className="w-3.5 h-3.5 text-red-400" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </div>
+    );
+  }
+  // pending
+  return (
+    <div className="w-6 h-6 rounded-full bg-white/5 flex items-center justify-center shrink-0">
+      <div className="w-1.5 h-1.5 rounded-full bg-white/15" />
     </div>
   );
 }

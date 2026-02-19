@@ -1,8 +1,8 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "FANGO × SUUMO | AI Ad Manager",
-  description: "AI-powered SUUMO advertising dashboard",
+  title: "SUUMO Auto-Nyuko",
+  description: "REINS → SUUMO 自動入稿ツール",
 };
 
 export default function RootLayout({ children }) {
