@@ -156,6 +156,41 @@ function buildNotionProps(data) {
 }
 
 // ── Report: stdout JSON + Slack Webhook ──────────────────
+function formatTimestamp() {
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const m = jst.getMonth() + 1;
+  const d = jst.getDate();
+  const h = String(jst.getHours()).padStart(2, "0");
+  const min = String(jst.getMinutes()).padStart(2, "0");
+  return `${m}/${d} ${h}:${min}`;
+}
+
+function notionDbUrl() {
+  if (!DB_ID) return "";
+  return `https://www.notion.so/${DB_ID.replace(/-/g, "")}`;
+}
+
+function buildSlackMessage(obj) {
+  const ts = formatTimestamp();
+  const lines = [`🏠 REINS新着物件情報: ${ts}`, "━━━━━━━━━━━━━━━━"];
+
+  if (obj.status === "error" && obj.error) {
+    lines.push(`❌ エラー: ${obj.error}`);
+  } else if (obj.synced > 0) {
+    lines.push(`✅ 追加数: ${obj.synced}件`);
+  } else {
+    lines.push("💤 追加数: 0件");
+  }
+
+  const url = notionDbUrl();
+  if (url && obj.status !== "error") {
+    lines.push(`📋 Notionで確認: ${url}`);
+  }
+
+  return lines.join("\n");
+}
+
 async function report(obj) {
   const json = JSON.stringify(obj);
   console.log(json);
@@ -165,11 +200,13 @@ async function report(obj) {
     return;
   }
 
+  const text = buildSlackMessage(obj);
+
   try {
     const res = await fetch(SLACK_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: json }),
+      body: JSON.stringify({ text }),
     });
     if (res.ok) {
       console.error("Slack通知送信完了");
