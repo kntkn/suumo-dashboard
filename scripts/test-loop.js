@@ -124,35 +124,131 @@ async function main() {
     const { filled, errors: formErrors } = await forrent.fillPropertyForm(mainFrame, reinsData);
 
     console.log("\n=== テキスト入力 ===");
-    const textErrors = await forrent.fillTexts(mainFrame, texts.catchCopy, texts.freeComment);
+    const textErrors = await forrent.fillTexts(mainFrame, texts.catchCopy, texts.freeComment, reinsData);
 
     console.log("\n=== 画像アップロード ===");
     const { uploaded, errors: uploadErrors } = await forrent.uploadImages(mainFrame, processedImages);
 
-    console.log("\n=== 交通入力 ===");
-    const transportResult = await forrent.fillTransportDirect(mainFrame, reinsData.交通);
+    console.log("\n=== 特徴項目チェック ===");
+    const tokuchoResult = await forrent.fillTokucho(mainFrame, reinsData);
+
+    console.log("\n=== 交通入力（地図修正 + らくらく交通） ===");
+    const transportResult = await forrent.fillTransportViaMap(forrentPage, mainFrame, reinsData.交通);
+
+    console.log("\n=== 周辺環境入力（らくらく周辺環境） ===");
+    const shuhenResult = await forrent.fillShuhenKankyo(forrentPage, mainFrame);
 
     // ══ 結果レポート ══
-    const allErrors = [...formErrors, ...transportResult.errors, ...textErrors, ...uploadErrors];
+    const allErrors = [...formErrors, ...transportResult.errors, ...textErrors, ...uploadErrors, ...shuhenResult.errors];
 
     console.log("\n" + "═".repeat(60));
-    console.log("  テスト結果");
+    console.log("  入力結果");
     console.log("═".repeat(60));
     console.log(`  成功フィールド: ${Object.keys(filled).length}`);
     console.log(`    ${Object.keys(filled).join(", ")}`);
     console.log(`  アップロード画像: ${uploaded.length}/${processedImages.length}`);
     console.log(`  交通: ${transportResult.filled.join(", ") || "なし"}`);
+    console.log(`  周辺環境: ${shuhenResult.filled.length}件 ${shuhenResult.filled.join(", ") || "なし"}`);
     if (allErrors.length > 0) {
       console.log(`  エラー(${allErrors.length}件):`);
       for (const e of allErrors) console.log(`    ✗ ${e}`);
     }
     console.log("═".repeat(60));
 
+    // ══ 確認画面でスコア＆バリデーションチェック ══
+    console.log("\n=== 確認画面へ遷移（スコア＆バリデーション確認） ===");
+    try {
+      await mainFrame.evaluate(() => window.scrollTo(0, 0));
+      await mainFrame.waitForTimeout(500);
+
+      // ダイアログ（alert/confirm）をキャッチ
+      const dialogs = [];
+      forrentPage.on("dialog", async (dialog) => {
+        console.log(`  [dialog] ${dialog.type()}: ${dialog.message()}`);
+        dialogs.push({ type: dialog.type(), message: dialog.message() });
+        await dialog.accept();
+      });
+
+      // 確認画面ボタン: <DIV id="regButton2"> onclick="checkEnsenEkiShuhen(); LINK(24);"
+      console.log("  確認画面ボタンクリック: #regButton2");
+      await mainFrame.evaluate(() => {
+        const btn = document.getElementById("regButton2");
+        if (btn) btn.click();
+      });
+
+      // フレームナビゲーション or ダイアログを待つ
+      await mainFrame.waitForTimeout(10000);
+
+      // ダイアログがあった場合出力
+      if (dialogs.length > 0) {
+        console.log(`  ダイアログ(${dialogs.length}件):`);
+        for (const d of dialogs) console.log(`    ${d.type}: ${d.message}`);
+      }
+
+      // mainFrameが変わっている可能性があるので再取得
+      const confirmFrame = forrentPage.frame({ name: "main" }) || mainFrame;
+
+      // エラーメッセージ or スコアを読み取り
+      const pageInfo = await confirmFrame.evaluate(() => {
+        const body = document.body?.innerText || "";
+
+        // エラーメッセージ
+        const errorEls = document.querySelectorAll('.errorMessage, .error, [class*="error"], [class*="Error"]');
+        const errors = [...errorEls].map(el => el.textContent.trim()).filter(Boolean);
+
+        // 赤字テキスト（バリデーションエラー）
+        const redTexts = [...document.querySelectorAll('span[style*="color"], font[color="red"], .red')];
+        const redErrors = redTexts.map(el => el.textContent.trim()).filter(t => t.length > 2 && t.length < 200);
+
+        // 名寄せスコア — 様々なパターンで探す
+        const scorePatterns = [
+          /名寄せスコア[：:\s]*(\d+)/,
+          /スコア[：:\s]*(\d+)/,
+          /合計[：:\s]*(\d+)\s*点/,
+          /(\d+)\s*点\s*\/\s*\d+\s*点/,
+        ];
+        let score = null;
+        for (const re of scorePatterns) {
+          const m = body.match(re);
+          if (m) { score = parseInt(m[1]); break; }
+        }
+
+        // ページタイトルやヘッダー
+        const h1 = document.querySelector('h1, h2, .title, .pageTitle');
+        const title = h1?.textContent?.trim() || "";
+
+        // URL情報
+        const url = window.location.href;
+
+        return { errors, redErrors, score, title, url, bodySnippet: body.slice(0, 3000) };
+      });
+
+      if (pageInfo.score !== null) {
+        console.log(`\n  ★ 名寄せスコア: ${pageInfo.score}点`);
+      }
+      if (pageInfo.title) {
+        console.log(`  ページ: ${pageInfo.title}`);
+      }
+      console.log(`  URL: ${pageInfo.url}`);
+      if (pageInfo.errors.length > 0) {
+        console.log(`  バリデーションエラー(${pageInfo.errors.length}件):`);
+        for (const e of pageInfo.errors) console.log(`    ✗ ${e}`);
+      }
+      if (pageInfo.redErrors.length > 0) {
+        console.log(`  赤字エラー(${pageInfo.redErrors.length}件):`);
+        for (const e of pageInfo.redErrors) console.log(`    ✗ ${e}`);
+      }
+      if (!pageInfo.score && pageInfo.errors.length === 0 && pageInfo.redErrors.length === 0) {
+        console.log(`  ページ本文(先頭1000字):\n${pageInfo.bodySnippet}`);
+      }
+    } catch (e) {
+      console.log(`  確認画面エラー: ${e.message.slice(0, 200)}`);
+    }
+
     // スクリーンショット保存
     const ssPath = path.join(downloadDir, `test-result-${Date.now()}.png`);
-    await mainFrame.evaluate(() => window.scrollTo(0, 0));
     await forrentPage.screenshot({ path: ssPath, fullPage: false });
-    console.log(`  スクリーンショット: ${ssPath}`);
+    console.log(`\n  スクリーンショット: ${ssPath}`);
 
     // ブラウザは閉じない（手動確認用）
     console.log("\n  ブラウザは開いたままです。Ctrl+C で終了。");

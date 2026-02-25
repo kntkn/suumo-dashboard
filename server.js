@@ -139,7 +139,8 @@ async function runNyuko(socket, reinsId) {
     const textErrors = await forrent.fillTexts(
       mainFrame,
       texts.catchCopy,
-      texts.freeComment
+      texts.freeComment,
+      reinsData
     );
 
     // 画像アップロード
