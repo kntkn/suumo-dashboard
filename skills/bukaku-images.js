@@ -122,6 +122,24 @@ async function itandiLogin(page) {
   console.log("[bukaku/itandi] ログイン中...");
   await page.goto(ITANDI.loginUrl, { waitUntil: "networkidle", timeout: 30000 });
   await page.waitForTimeout(2000);
+
+  // 既にログイン済み（リダイレクトされた場合）
+  if (page.url().includes("itandibb.com") && !page.url().includes("sign_in")) {
+    console.log("[bukaku/itandi] 既にログイン済み");
+    return true;
+  }
+
+  // ログインフォームの存在を確認
+  const emailField = await page.$("#email");
+  if (!emailField) {
+    // ログインページではない → 既にログイン済みの可能性
+    await page.goto(ITANDI.homeUrl, { waitUntil: "networkidle", timeout: 15000 });
+    await page.waitForTimeout(2000);
+    const isLoggedIn = page.url().includes("itandibb.com");
+    console.log(`[bukaku/itandi] ログインフォームなし → ${isLoggedIn ? "ログイン済み" : "失敗"}`);
+    return isLoggedIn;
+  }
+
   await page.fill("#email", ITANDI.email);
   await page.fill("#password", ITANDI.password);
   await Promise.all([
@@ -214,6 +232,19 @@ async function ieloveBBLogin(page) {
   console.log("[bukaku/ielovebb] ログイン中...");
   await page.goto(IELOVEBB.loginUrl, { waitUntil: "networkidle", timeout: 30000 });
   await page.waitForTimeout(2000);
+
+  // 既にログイン済み（リダイレクトされた場合）
+  if (page.url().includes("/top/") || page.url().includes("/ielovebb/")) {
+    console.log("[bukaku/ielovebb] 既にログイン済み");
+    return true;
+  }
+
+  // ログインフォームの存在を確認
+  const loginBtn = await page.$("#loginButton");
+  if (!loginBtn) {
+    console.log("[bukaku/ielovebb] ログインフォームなし → 失敗");
+    return false;
+  }
 
   await page.fill('input[placeholder="ログインIDを入力"]', IELOVEBB.email);
   await page.fill('input[placeholder="パスワードを入力"]', IELOVEBB.password);
@@ -370,19 +401,28 @@ function downloadImage(url, outputPath) {
 
 /**
  * 画像が不足しているかチェック
- * 5pt カテゴリ（01-05）が欠けている場合 true
+ * - 5ptカテゴリ（01-05）が1つでも欠けている場合
+ * - 全体のカテゴリカバー率が低い場合（実画像10枚未満）
  *
  * @param {Array} processedImages - AI分類済み画像
- * @returns {{ insufficient: boolean, missingCategories: string[] }}
+ * @returns {{ insufficient: boolean, missingCategories: string[], missing1ptCategories: string[] }}
  */
 function checkImageSufficiency(processedImages) {
   const HIGH_VALUE_CATS = ["01", "02", "03", "04", "05"];
+  const ALL_CATS = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14"];
   const presentCats = new Set(processedImages.map(img => img.categoryId).filter(Boolean));
-  const missing = HIGH_VALUE_CATS.filter(cat => !presentCats.has(cat));
+
+  const missing5pt = HIGH_VALUE_CATS.filter(cat => !presentCats.has(cat));
+  const missing1pt = ALL_CATS.filter(cat => !presentCats.has(cat) && !HIGH_VALUE_CATS.includes(cat));
+
+  // 不足判定: 5ptカテゴリが欠けている OR 全体の画像数が少ない（1ptカテゴリ大量不足）
+  const insufficient = missing5pt.length > 0 || (processedImages.length < 10 && missing1pt.length >= 3);
 
   return {
-    insufficient: missing.length > 0,
-    missingCategories: missing,
+    insufficient,
+    missingCategories: [...missing5pt, ...missing1pt],
+    missing5pt,
+    missing1pt,
     presentCount: processedImages.length,
   };
 }
