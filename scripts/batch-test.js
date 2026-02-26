@@ -18,7 +18,7 @@ const reins = require("../skills/reins");
 const forrent = require("../skills/forrent");
 const { analyzeAndCropImages } = require("../skills/image-ai");
 const { generateTexts } = require("../skills/text-ai");
-// const { captureMapScreenshot } = require("../skills/google-maps"); // 修正点12: 廃止
+const { checkImageSufficiency, fetchBukakuImages } = require("../skills/bukaku-images");
 
 const fresh = process.argv.includes("--fresh");
 
@@ -65,11 +65,31 @@ async function processProperty(context, reinsPage, reinsId, index) {
 
   if (cache) {
     reinsData = cache.reinsData;
-    // map_surrounding除外（修正点12: Google Maps画像は使わない）
     processedImages = (cache.processedImages || []).filter(
       img => !img.localPath.includes("map_surrounding")
     );
     texts = cache.texts;
+
+    // キャッシュ使用時も物確画像が不足なら取得
+    const sufficiency = checkImageSufficiency(processedImages);
+    if (sufficiency.insufficient && !cache.bukakuDone) {
+      console.log(`  [cache+bukaku] 物確画像取得中（不足: ${sufficiency.missingCategories.join(",")}）...`);
+      try {
+        const bukakuImages = await fetchBukakuImages(context, reinsData, downloadDir);
+        if (bukakuImages.length > 0) {
+          const existingCats = processedImages.map(img => img.categoryId);
+          const bukakuProcessed = await analyzeAndCropImages(bukakuImages, downloadDir, existingCats);
+          processedImages.push(...bukakuProcessed);
+          console.log(`  物確: ${bukakuProcessed.length}枚追加 → 合計${processedImages.length}枚`);
+        }
+        // キャッシュ更新
+        cache.processedImages = processedImages;
+        cache.bukakuDone = true;
+        fs.writeFileSync(cacheFile, JSON.stringify(cache, null, 2));
+      } catch (e) {
+        console.log(`  物確エラー: ${e.message.slice(0, 80)}`);
+      }
+    }
   } else {
     // REINS データ取得
     console.log("  [1/6] REINS検索...");
@@ -104,7 +124,24 @@ async function processProperty(context, reinsPage, reinsId, index) {
     processedImages = await analyzeAndCropImages(downloaded, downloadDir);
     console.log(`  ${processedImages.length}枚分類完了`);
 
-    // Google Maps周辺環境スクショは廃止（修正点12）
+    // 物確プラットフォームから追加画像
+    const sufficiency = checkImageSufficiency(processedImages);
+    if (sufficiency.insufficient) {
+      console.log(`  [3.5/6] 物確画像取得中（不足: ${sufficiency.missingCategories.join(",")}）...`);
+      try {
+        const bukakuImages = await fetchBukakuImages(context, reinsData, downloadDir);
+        if (bukakuImages.length > 0) {
+          const existingCats = processedImages.map(img => img.categoryId);
+          const bukakuProcessed = await analyzeAndCropImages(bukakuImages, downloadDir, existingCats);
+          processedImages.push(...bukakuProcessed);
+          console.log(`  物確: ${bukakuProcessed.length}枚追加 → 合計${processedImages.length}枚`);
+        } else {
+          console.log(`  物確: 画像なし`);
+        }
+      } catch (e) {
+        console.log(`  物確エラー: ${e.message.slice(0, 80)}`);
+      }
+    }
 
     // AIテキスト生成
     console.log("  [4/6] AIテキスト生成...");
@@ -112,7 +149,7 @@ async function processProperty(context, reinsPage, reinsId, index) {
     console.log(`  キャッチ: "${texts.catchCopy}"`);
 
     // キャッシュ保存
-    const cacheData = { reinsData, processedImages, texts, cachedAt: new Date().toISOString() };
+    const cacheData = { reinsData, processedImages, texts, bukakuDone: true, cachedAt: new Date().toISOString() };
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2));
   }
 

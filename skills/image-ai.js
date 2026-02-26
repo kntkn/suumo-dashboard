@@ -85,7 +85,7 @@ IDのみ回答（例: 01）。間取り図・平面図は必ず04。建物外観
  * @param {string} downloadDir
  * @returns {Array<{localPath: string, categoryId: string, categoryLabel: string}>}
  */
-async function analyzeAndCropImages(downloaded, downloadDir) {
+async function analyzeAndCropImages(downloaded, downloadDir, existingCategories = []) {
   const outputDir = path.join(downloadDir, "processed");
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -93,7 +93,7 @@ async function analyzeAndCropImages(downloaded, downloadDir) {
   if (validImages.length === 0) return [];
 
   const processedImages = [];
-  const usedCategories = new Set();
+  const usedCategories = new Set(existingCategories);
 
   // 5ptカテゴリを優先的に埋めるため、まず全画像を分類してからソート
   const classifications = [];

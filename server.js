@@ -13,9 +13,7 @@ const reins = require("./skills/reins");
 const forrent = require("./skills/forrent");
 const { analyzeAndCropImages } = require("./skills/image-ai");
 const { generateTexts } = require("./skills/text-ai");
-// const { captureMapScreenshot } = require("./skills/google-maps"); // 修正点12: 廃止
-// score-checker は情報入力完了後の手動確認フェーズで使用（自動実行しない）
-// const { readNayoseScore, navigateToScorePage } = require("./skills/score-checker");
+const { checkImageSufficiency, fetchBukakuImages } = require("./skills/bukaku-images");
 
 const dev = process.env.NODE_ENV !== "production";
 const nextApp = next({ dev });
@@ -96,8 +94,25 @@ async function runNyuko(socket, reinsId) {
     const processedImages = await analyzeAndCropImages(downloaded, downloadDir);
     emit(3, "done", `${processedImages.length}枚のカテゴリ画像を生成`);
 
-    // Step 3.5: Google Maps周辺環境スクショは廃止（修正点12）
-    // 周辺環境は「らくらく周辺環境入力」で自動取得する
+    // ── Step 3.5: 物確プラットフォームから追加画像 ──
+    const sufficiency = checkImageSufficiency(processedImages);
+    if (sufficiency.insufficient) {
+      emit(3, "running", `5ptカテゴリ不足(${sufficiency.missingCategories.join(",")}) → 物確画像を取得中...`);
+      try {
+        const bukakuImages = await fetchBukakuImages(context, reinsData, downloadDir);
+        if (bukakuImages.length > 0) {
+          const existingCats = processedImages.map(img => img.categoryId);
+          const bukakuProcessed = await analyzeAndCropImages(bukakuImages, downloadDir, existingCats);
+          processedImages.push(...bukakuProcessed);
+          emit(3, "done", `${processedImages.length}枚（REINS ${processedImages.length - bukakuProcessed.length} + 物確 ${bukakuProcessed.length}）`);
+        } else {
+          emit(3, "done", `${processedImages.length}枚（物確画像なし）`);
+        }
+      } catch (e) {
+        console.error("[bukaku] Error:", e.message);
+        emit(3, "done", `${processedImages.length}枚（物確取得エラー: ${e.message.slice(0, 50)}）`);
+      }
+    }
 
     // ── Step 4: AIテキスト生成 ──
     emit(4, "running", "キャッチコピーとコメントを生成中...");
