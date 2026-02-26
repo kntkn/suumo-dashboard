@@ -80,10 +80,13 @@ async function main() {
 
       console.log("\n=== 画像スクリーンショット ===");
       const imagesMeta = await reins.extractImageData(reinsPage);
-      const downloaded = await reins.screenshotAllImages(reinsPage, imagesMeta.length, downloadDir);
+      const downloaded = await reins.screenshotAllImages(reinsPage, imagesMeta, downloadDir);
       console.log(`  ${downloaded.length}枚スクリーンショット完了`);
+      for (const d of downloaded) {
+        if (d.title) console.log(`  画像${d.index}: "${d.title}"`);
+      }
 
-      console.log("\n=== AI 画像処理 ===");
+      console.log("\n=== 画像処理 ===");
       processedImages = await analyzeAndCropImages(downloaded, downloadDir);
       console.log(`  ${processedImages.length}枚カテゴリ画像生成`);
 

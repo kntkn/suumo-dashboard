@@ -7,11 +7,11 @@ import { motion, AnimatePresence } from "framer-motion";
 const STEPS = [
   { label: "REINS ログイン", icon: "key" },
   { label: "データ抽出", icon: "search" },
-  { label: "画像ダウンロード", icon: "image" },
-  { label: "AI 画像処理", icon: "sparkle" },
+  { label: "画像スクリーンショット", icon: "image" },
+  { label: "AI 画像処理 + 周辺環境", icon: "sparkle" },
   { label: "AI テキスト生成", icon: "text" },
-  { label: "forrent.jp 入稿", icon: "upload" },
-  { label: "スコア確認", icon: "chart" },
+  { label: "SUUMO フォーム入力", icon: "upload" },
+  { label: "確認画面 / スコア", icon: "chart" },
 ];
 
 export default function NyukoPage() {
@@ -326,78 +326,77 @@ function DonePhase({ result, errorMsg, reinsId, onReset }) {
 
   if (!result) return null;
 
+  const hasScore = result.score !== null && result.score !== undefined;
+  const scoreColor = hasScore
+    ? result.score >= 40 ? "emerald" : result.score >= 35 ? "amber" : "red"
+    : "white";
+  const glowClass = hasScore
+    ? result.score >= 40 ? "glow-success border-emerald-500/20" : "glow-accent border-violet-500/20"
+    : "glow-accent border-violet-500/20";
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -12 }}
-      className="flex flex-col items-center gap-6"
+      className="flex flex-col items-center gap-5"
     >
       {/* Score header */}
-      <div className="w-full max-w-md glass rounded-xl p-6 glow-success border-emerald-500/20">
+      <div className={`w-full max-w-md glass rounded-xl p-6 ${glowClass}`}>
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-sm font-semibold text-emerald-400">
+            <h3 className={`text-sm font-semibold ${hasScore && result.score >= 40 ? "text-emerald-400" : "text-violet-400"}`}>
               入稿完了
             </h3>
             <p className="text-xs text-white/30 mt-0.5">
               {result.propertyName || reinsId}
             </p>
           </div>
-          <div className="text-right">
-            <p className="text-3xl font-bold tabular-nums text-white">
-              {result.score}
-              <span className="text-sm text-white/30 font-normal ml-1">/ 43</span>
-            </p>
-            <p className="text-[10px] text-white/25">名寄せスコア</p>
-          </div>
+          {hasScore && (
+            <div className="text-right">
+              <p className="text-3xl font-bold tabular-nums text-white">
+                {result.score}
+                <span className="text-sm text-white/30 font-normal ml-1">/ 43</span>
+              </p>
+              <p className="text-[10px] text-white/25">名寄せスコア</p>
+            </div>
+          )}
         </div>
 
         {/* Score bar */}
-        <div className="h-2 bg-white/5 rounded-full overflow-hidden mb-4">
-          <div
-            className={`h-full rounded-full transition-all ${
-              result.score >= 40
-                ? "bg-emerald-500"
-                : result.score >= 30
-                  ? "bg-amber-500"
-                  : "bg-red-500"
-            }`}
-            style={{ width: `${(result.score / 43) * 100}%` }}
-          />
-        </div>
-
-        {/* Summary */}
-        <div className="grid grid-cols-2 gap-3 text-xs">
-          <div className="bg-white/3 rounded-lg p-2.5">
-            <p className="text-white/30 mb-1">入力フィールド</p>
-            <p className="text-white font-medium">{result.filledFields}件</p>
+        {hasScore && (
+          <div className="h-2 bg-white/5 rounded-full overflow-hidden mb-4">
+            <div
+              className={`h-full rounded-full transition-all ${
+                scoreColor === "emerald" ? "bg-emerald-500"
+                  : scoreColor === "amber" ? "bg-amber-500"
+                    : "bg-red-500"
+              }`}
+              style={{ width: `${(result.score / 43) * 100}%` }}
+            />
           </div>
-          <div className="bg-white/3 rounded-lg p-2.5">
-            <p className="text-white/30 mb-1">アップロード画像</p>
-            <p className="text-white font-medium">{result.uploadedImages}枚</p>
+        )}
+
+        {/* Summary grid */}
+        <div className="grid grid-cols-4 gap-2 text-xs">
+          <div className="bg-white/3 rounded-lg p-2 text-center">
+            <p className="text-white/25 text-[10px] mb-0.5">フィールド</p>
+            <p className="text-white font-semibold">{result.filledFields}</p>
+          </div>
+          <div className="bg-white/3 rounded-lg p-2 text-center">
+            <p className="text-white/25 text-[10px] mb-0.5">画像</p>
+            <p className="text-white font-semibold">{result.uploadedImages}</p>
+          </div>
+          <div className="bg-white/3 rounded-lg p-2 text-center">
+            <p className="text-white/25 text-[10px] mb-0.5">交通</p>
+            <p className="text-white font-semibold">{result.transport?.length || 0}</p>
+          </div>
+          <div className="bg-white/3 rounded-lg p-2 text-center">
+            <p className="text-white/25 text-[10px] mb-0.5">周辺環境</p>
+            <p className="text-white font-semibold">{result.shuhen?.length || 0}</p>
           </div>
         </div>
       </div>
-
-      {/* Score breakdown */}
-      {result.breakdown && Object.keys(result.breakdown).length > 0 && (
-        <div className="w-full max-w-md glass rounded-xl p-4">
-          <h4 className="text-xs text-white/40 mb-3 font-medium">
-            スコア内訳
-          </h4>
-          <div className="space-y-2">
-            {Object.entries(result.breakdown).map(([key, pts]) => (
-              <div key={key} className="flex items-center justify-between text-xs">
-                <span className="text-white/50">{key}</span>
-                <span className={pts > 0 ? "text-emerald-400" : "text-white/20"}>
-                  {pts}点
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Generated texts */}
       {(result.catchCopy || result.comment) && (
@@ -416,7 +415,7 @@ function DonePhase({ result, errorMsg, reinsId, onReset }) {
           {result.comment && (
             <div>
               <p className="text-[10px] text-white/25 mb-1">フリーコメント</p>
-              <p className="text-xs text-white/60 bg-white/3 rounded-lg p-2.5 leading-relaxed">
+              <p className="text-xs text-white/60 bg-white/3 rounded-lg p-2.5 leading-relaxed whitespace-pre-wrap">
                 {result.comment}
               </p>
             </div>
@@ -424,7 +423,23 @@ function DonePhase({ result, errorMsg, reinsId, onReset }) {
         </div>
       )}
 
-      {/* Errors */}
+      {/* Validation errors from confirmation page */}
+      {result.validationErrors?.length > 0 && (
+        <div className="w-full max-w-md glass rounded-xl p-4 border-red-500/10">
+          <h4 className="text-xs text-red-400/70 mb-2 font-medium">
+            バリデーションエラー ({result.validationErrors.length}件)
+          </h4>
+          <div className="space-y-1">
+            {result.validationErrors.map((err, i) => (
+              <p key={i} className="text-[11px] text-red-300/50">
+                {err}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Pipeline warnings */}
       {result.errors?.length > 0 && (
         <div className="w-full max-w-md glass rounded-xl p-4 border-amber-500/10">
           <h4 className="text-xs text-amber-400/70 mb-2 font-medium">
@@ -438,6 +453,13 @@ function DonePhase({ result, errorMsg, reinsId, onReset }) {
             ))}
           </div>
         </div>
+      )}
+
+      {/* Saved path */}
+      {result.savedTo && (
+        <p className="text-[10px] text-white/15 font-mono">
+          {result.savedTo}
+        </p>
       )}
 
       {/* Reset button */}

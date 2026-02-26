@@ -13,7 +13,7 @@ const reins = require("./skills/reins");
 const forrent = require("./skills/forrent");
 const { analyzeAndCropImages } = require("./skills/image-ai");
 const { generateTexts } = require("./skills/text-ai");
-const { captureMapScreenshot } = require("./skills/google-maps");
+// const { captureMapScreenshot } = require("./skills/google-maps"); // 修正点12: 廃止
 // score-checker は情報入力完了後の手動確認フェーズで使用（自動実行しない）
 // const { readNayoseScore, navigateToScorePage } = require("./skills/score-checker");
 
@@ -84,30 +84,20 @@ async function runNyuko(socket, reinsId) {
     emit(2, "running", "画像セクションに移動中...");
     const imagesMeta = await reins.extractImageData(reinsPage);
     emit(2, "running", `${imagesMeta.length}枚の画像をスクリーンショット中...`);
-    const downloaded = await reins.screenshotAllImages(reinsPage, imagesMeta.length, downloadDir);
+    const downloaded = await reins.screenshotAllImages(reinsPage, imagesMeta, downloadDir);
     emit(2, "done", `${downloaded.length}枚スクリーンショット完了 → ~/Desktop/suumo-nyuko/${reinsId}/`);
+    // REINSタイトルをログ
+    for (const d of downloaded) {
+      if (d.title) console.log(`  画像${d.index}: "${d.title}"`);
+    }
 
     // ── Step 3: AI画像処理 ──
-    emit(3, "running", "画像を分析・カテゴリ分類中...");
+    emit(3, "running", "画像をカテゴリ分類中...");
     const processedImages = await analyzeAndCropImages(downloaded, downloadDir);
     emit(3, "done", `${processedImages.length}枚のカテゴリ画像を生成`);
 
-    // ── Step 3.5: Google Maps 周辺環境 ──
-    emit(3, "running", "Google Mapsで周辺環境を撮影中...");
-    const address = [
-      reinsData.都道府県名,
-      reinsData.所在地名１,
-      reinsData.所在地名２,
-      reinsData.所在地名３,
-    ].filter(Boolean).join("");
-
-    if (address) {
-      const mapImage = await captureMapScreenshot(forrentPage, address, path.join(downloadDir, "processed"));
-      if (mapImage) {
-        processedImages.push(mapImage);
-        emit(3, "done", `${processedImages.length}枚（周辺環境含む）`);
-      }
-    }
+    // Step 3.5: Google Maps周辺環境スクショは廃止（修正点12）
+    // 周辺環境は「らくらく周辺環境入力」で自動取得する
 
     // ── Step 4: AIテキスト生成 ──
     emit(4, "running", "キャッチコピーとコメントを生成中...");
@@ -150,17 +140,84 @@ async function runNyuko(socket, reinsId) {
       processedImages
     );
 
-    // 交通入力（最後に実行 — DOM直接操作で安全に）
+    // 特徴項目チェック
+    emit(5, "running", "特徴項目をチェック中...");
+    const tokuchoResult = await forrent.fillTokucho(mainFrame, reinsData);
+
+    // 交通入力（地図修正 + らくらく交通）
     emit(5, "running", "交通情報を入力中...");
-    const transportResult = await forrent.fillTransportDirect(mainFrame, reinsData.交通);
+    const transportResult = await forrent.fillTransportViaMap(forrentPage, mainFrame, reinsData.交通);
+
+    // 周辺環境入力（らくらく周辺環境）
+    emit(5, "running", "周辺環境を入力中...");
+    const shuhenResult = await forrent.fillShuhenKankyo(forrentPage, mainFrame);
 
     const allErrors = [
       ...formErrors,
       ...transportResult.errors,
       ...textErrors,
       ...uploadErrors,
+      ...shuhenResult.errors,
     ];
-    emit(5, "done", `入力${Object.keys(filled).length}件, 画像${uploaded.length}枚, 交通${transportResult.filled.length}件`);
+    emit(5, "done", `入力${Object.keys(filled).length}件, 画像${uploaded.length}枚, 交通${transportResult.filled.length}件, 周辺${shuhenResult.filled.length}件`);
+
+    // ── Step 6: 確認画面でスコア＆バリデーションチェック ──
+    emit(6, "running", "確認画面に遷移中...");
+    let score = null;
+    let validationErrors = [];
+    try {
+      await mainFrame.evaluate(() => window.scrollTo(0, 0));
+      await mainFrame.waitForTimeout(500);
+
+      const dialogs = [];
+      forrentPage.on("dialog", async (dialog) => {
+        dialogs.push({ type: dialog.type(), message: dialog.message() });
+        await dialog.accept();
+      });
+
+      await mainFrame.evaluate(() => {
+        const btn = document.getElementById("regButton2");
+        if (btn) btn.click();
+      });
+
+      await mainFrame.waitForTimeout(10000);
+
+      const confirmFrame = forrentPage.frame({ name: "main" }) || mainFrame;
+      const pageInfo = await confirmFrame.evaluate(() => {
+        const body = document.body?.innerText || "";
+        const errorEls = document.querySelectorAll('.errorMessage, .error, [class*="error"], [class*="Error"]');
+        const errors = [...errorEls].map(el => el.textContent.trim()).filter(Boolean);
+        const redTexts = [...document.querySelectorAll('span[style*="color"], font[color="red"], .red')];
+        const redErrors = redTexts.map(el => el.textContent.trim()).filter(t => t.length > 2 && t.length < 200);
+        const scorePatterns = [
+          /名寄せスコア[：:\s]*(\d+)/, /スコア[：:\s]*(\d+)/,
+          /合計[：:\s]*(\d+)\s*点/, /(\d+)\s*点\s*\/\s*\d+\s*点/,
+        ];
+        let score = null;
+        for (const re of scorePatterns) {
+          const m = body.match(re);
+          if (m) { score = parseInt(m[1]); break; }
+        }
+        return { errors, redErrors, score, bodySnippet: body.slice(0, 2000) };
+      });
+
+      score = pageInfo.score;
+      validationErrors = [...pageInfo.errors, ...pageInfo.redErrors];
+
+      if (dialogs.length > 0) {
+        validationErrors.push(...dialogs.map(d => `[${d.type}] ${d.message}`));
+      }
+
+      if (score !== null) {
+        emit(6, "done", `名寄せスコア: ${score}点 / 43点`);
+      } else if (validationErrors.length > 0) {
+        emit(6, "done", `バリデーションエラー ${validationErrors.length}件`);
+      } else {
+        emit(6, "done", "確認画面表示済み");
+      }
+    } catch (e) {
+      emit(6, "done", `確認画面エラー: ${e.message.slice(0, 100)}`);
+    }
 
     // ゴール: 情報入力完了。フォームは送信せず、ブラウザを開いたまま確認待ち。
     done({
@@ -170,6 +227,10 @@ async function runNyuko(socket, reinsId) {
       filledFields: Object.keys(filled).length,
       uploadedImages: uploaded.length,
       transport: transportResult.filled,
+      tokucho: tokuchoResult,
+      shuhen: shuhenResult.filled,
+      score,
+      validationErrors,
       errors: allErrors,
       savedTo: downloadDir,
     });

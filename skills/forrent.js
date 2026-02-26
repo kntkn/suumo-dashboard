@@ -174,6 +174,23 @@ async function setCheckbox(f, id, checked, label) {
   }
 }
 
+/**
+ * Radio button をインデックス（0始まり）で選択する。
+ * forrent.jp のradio value値は推測不可能なため、index指定が最も確実。
+ */
+async function selectRadioByIndex(f, fieldName, index) {
+  return f.evaluate(({ fieldName, index }) => {
+    const selector = `input[type="radio"][name="\${bukkenInputForm.${fieldName}}"]`;
+    const radios = document.querySelectorAll(selector);
+    if (radios.length > index) {
+      radios[index].checked = true;
+      radios[index].dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+    return false;
+  }, { fieldName, index });
+}
+
 /** wait for cascade select to populate (options > 1) */
 async function waitForCascade(f, selectId, timeoutMs = 5000) {
   try {
@@ -268,18 +285,22 @@ async function fillPropertyForm(mainFrame, reinsData) {
   if (bFloors) ok("地下階建", await fillById(mainFrame, "chikaInput", bFloors, "地下階建"));
 
   // 階部分 — id="kaibubun", max=5
-  // 優先順位: 1) 所在階が有効な数字, 2) 部屋番号から推定（901→9, 1201→12）
+  // 優先順位: 1) 所在階が有効な数字, 2) 部屋番号から推定（901→9, 1201→12）, 3) 部屋番号1-2桁の場合
   let floor = null;
   const rawFloor = norm(reinsData.所在階 || "");
-  console.log(`[forrent] debug: 所在階="${reinsData.所在階}", norm="${rawFloor}", 部屋番号="${reinsData.部屋番号}"`);
   if (/^\d+$/.test(rawFloor)) {
     floor = rawFloor;
   } else if (reinsData.部屋番号) {
     const digits = norm(reinsData.部屋番号).replace(/\D/g, "");
     if (digits.length >= 3) {
       floor = String(parseInt(digits.slice(0, -2), 10)); // 901→9, 1201→12
+    } else if (digits.length === 1 || digits.length === 2) {
+      // 小規模物件: 部屋番号が1-2桁 → 地上階建が2-3階なら部屋番号の先頭桁を階に
+      const totalFloors = parseInt(norm(reinsData.地上階層 || "")?.match(/(\d+)/)?.[1] || "0", 10);
+      if (totalFloors > 0 && totalFloors <= 5 && parseInt(digits[0], 10) <= totalFloors) {
+        floor = digits[0]; // "4"→4階, "201"→already handled above
+      }
     }
-    console.log(`[forrent] debug: digits="${digits}", floor="${floor}"`);
   }
   if (floor) ok("階部分", await fillById(mainFrame, "kaibubun", floor, "階部分"));
 
@@ -288,8 +309,13 @@ async function fillPropertyForm(mainFrame, reinsData) {
 
   // 物件種別 — select name="${bukkenInputForm.bukkenShuCd}"
   //   マンション(01), アパート(02), 一戸建て(11), テラス・タウンハウス(16), その他(99)
+  //   木造/軽量鉄骨の場合は物件種目がマンションでもアパート(02)に強制変更
   if (reinsData.物件種目) {
-    const code = PROPERTY_TYPE_CODE[norm(reinsData.物件種目)];
+    let code = PROPERTY_TYPE_CODE[norm(reinsData.物件種目)];
+    const struct = norm(reinsData.建物構造 || "");
+    if (code === "01" && /木造|軽量鉄骨|LS/.test(struct)) {
+      code = "02"; // マンション+木造/軽量鉄骨 → アパート
+    }
     if (code) ok("物件種別", await selectByName(mainFrame, `${S}bukkenShuCd}`, code, "物件種別"));
   }
 
@@ -303,13 +329,38 @@ async function fillPropertyForm(mainFrame, reinsData) {
   // 築年 — id="Wareki2Seireki1", max=4 (西暦)
   const chikuNorm = norm(reinsData.築年月);
   const yearM = chikuNorm?.match(/(\d{4})年/);
-  if (yearM) ok("築年", await fillById(mainFrame, "Wareki2Seireki1", yearM[1], "築年"));
+  if (yearM) {
+    ok("築年", await fillById(mainFrame, "Wareki2Seireki1", yearM[1], "築年"));
+  } else {
+    // 築年月が不明の場合は必須フィールドなのでフォールバック（1990年1月）
+    console.log("[forrent] ! 築年月が不明 → 1990年1月をフォールバック");
+    await fillById(mainFrame, "Wareki2Seireki1", "1990", "築年(FB)");
+    ok("築年", true);
+  }
 
   // 築月 — name="${bukkenInputForm.chikuGetsu}", no id, max=2
+  // 月がない場合（"1974年（昭和49年）"等）は1月をデフォルト
   const monthM = chikuNorm?.match(/(\d{1,2})月/);
-  if (monthM) ok("築月", await fillByName(mainFrame, `${S}chikuGetsu}`, monthM[1], "築月"));
+  const chikuMonth = monthM ? monthM[1] : "1";
+  ok("築月", await fillByName(mainFrame, `${S}chikuGetsu}`, chikuMonth, "築月"));
 
-  // 新築/中古 — #shinchikuKbnCd1(中古=2) がデフォルトON → そのまま
+  // 新築/中古/未入居（入居区分） — shinchikuKbnCd: 1=新築, 2=中古, 3=未入居
+  // 必須フィールド（バリデーション「入居区分を選択してください」を回避）
+  {
+    let shinchikuIdx = 0; // default: 中古 (value=2, index=0=#shinchikuKbnCd1)
+    if (yearM) {
+      const builtYear = parseInt(yearM[1], 10);
+      const currentYear = new Date().getFullYear();
+      if (currentYear - builtYear <= 1) {
+        // 築1年以内 → 新築
+        shinchikuIdx = 1; // value=1, index=1=#shinchikuKbnCd2
+      }
+    }
+    // 現況が「空室」で入居時期が「即時」で築年月が新しい → 未入居の可能性
+    // ただし安全策として中古/新築の2択に限定
+    ok("入居区分", await selectRadioByIndex(mainFrame, "shinchikuKbnCd", shinchikuIdx));
+    if (filled["入居区分"]) console.log(`[forrent] + 入居区分: ${shinchikuIdx === 0 ? "中古" : "新築"}`);
+  }
 
   // ═══ 2. 所在地 ═══
 
@@ -365,9 +416,25 @@ async function fillPropertyForm(mainFrame, reinsData) {
         ? addr3  // 丁目は所在地名２にあった → 所在地名３は全て番地
         : addr3.replace(/^\d+丁目/, "").trim();
       if (rest) ok("番地", await fillById(mainFrame, "banchiNm", rest, "番地"));
-    } else if (addr3) {
-      // 丁目なし → 全部番地に入力
-      ok("番地", await fillById(mainFrame, "banchiNm", addr3, "番地"));
+    } else {
+      // 丁目なし（一番町、二番町 等）→ azaListの最初の有効オプションを選択
+      const azaSelected = await mainFrame.evaluate(() => {
+        const el = document.getElementById("azaList");
+        if (!el) return false;
+        const opts = Array.from(el.options).filter(o => o.value && o.value !== "");
+        if (opts.length > 0) {
+          el.value = opts[0].value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return opts[0].text;
+        }
+        return false;
+      });
+      if (azaSelected) {
+        ok("字丁", true);
+        console.log(`[forrent] + 字丁(auto): "${azaSelected}"`);
+        await mainFrame.waitForTimeout(1000);
+      }
+      if (addr3) ok("番地", await fillById(mainFrame, "banchiNm", addr3, "番地"));
     }
   }
 
@@ -384,15 +451,16 @@ async function fillPropertyForm(mainFrame, reinsData) {
 
   // ═══ 5. 間取り ═══
 
-  // 部屋数 — id="heyaCntInput", max=2
-  const rooms = norm(reinsData.間取部屋数)?.match(/(\d+)/)?.[1];
-  if (rooms) ok("部屋数", await fillById(mainFrame, "heyaCntInput", rooms, "部屋数"));
-
   // 間取りタイプ — select name="${bukkenInputForm.madoriTypeKbnCd}"
   //   ワンルーム(01), K(02), DK(03), SDK(04), LDK(05), SLDK(06), LK(07), SK(08), SLK(09)
-  if (reinsData.間取タイプ) {
-    const code = MADORI_TYPE_CODE[norm(reinsData.間取タイプ)];
-    if (code) ok("間取りタイプ", await selectByName(mainFrame, `${S}madoriTypeKbnCd}`, code, "間取りタイプ"));
+  const madoriCode = reinsData.間取タイプ ? MADORI_TYPE_CODE[norm(reinsData.間取タイプ)] : null;
+  if (madoriCode) ok("間取りタイプ", await selectByName(mainFrame, `${S}madoriTypeKbnCd}`, madoriCode, "間取りタイプ"));
+
+  // 部屋数 — id="heyaCntInput", max=2
+  // ワンルーム(01)の場合、部屋数は入力不可（バリデーションエラーになる）
+  if (madoriCode !== "01") {
+    const rooms = norm(reinsData.間取部屋数)?.match(/(\d+)/)?.[1];
+    if (rooms) ok("部屋数", await fillById(mainFrame, "heyaCntInput", rooms, "部屋数"));
   }
 
   // 面積 — id="mensekiIntegerInput"(max=3) + id="mensekiDecimalInput"(max=2)
@@ -405,42 +473,39 @@ async function fillPropertyForm(mainFrame, reinsData) {
 
   // ═══ 6. 入居時期 ═══
   // nyukyoKbnCd1(即=1), nyukyoKbnCd2(相談=2), nyukyoKbnCd3(年月=3)
-  if (reinsData.入居時期) {
-    const nyukyo = norm(reinsData.入居時期);
+  // nyukyoNen/nyukyoTsuki: 年月指定時のテキスト入力
+  {
+    const nyukyo = norm(reinsData.入居時期 || "");
     if (/即/.test(nyukyo)) {
       await mainFrame.click("#nyukyoKbnCd1").catch(() => {});
       ok("入居時期", true);
-    } else if (/相談/.test(nyukyo)) {
-      await mainFrame.click("#nyukyoKbnCd2").catch(() => {});
-      ok("入居時期", true);
     } else {
-      // 年月指定
-      await mainFrame.click("#nyukyoKbnCd3").catch(() => {});
-      ok("入居時期", true);
+      // 年月パターン抽出: "2026年3月" や "令和8年3月"
+      const ymMatch = nyukyo.match(/(\d{4})\s*年\s*(\d{1,2})\s*月/);
+      if (ymMatch) {
+        await mainFrame.click("#nyukyoKbnCd3").catch(() => {});
+        await mainFrame.waitForTimeout(300);
+        await fillByName(mainFrame, `${S}nyukyoNen}`, ymMatch[1], "入居年");
+        await fillByName(mainFrame, `${S}nyukyoTsuki}`, ymMatch[2], "入居月");
+        ok("入居時期", true);
+      } else {
+        // "相談", "期日指定", 未取得, その他 → 相談にフォールバック
+        await mainFrame.click("#nyukyoKbnCd2").catch(() => {});
+        ok("入居時期", true);
+      }
     }
     await mainFrame.waitForTimeout(300);
   }
 
   // ═══ 7. 取引態様 ═══
-  // torihikiTaiyoKbnCd: 貸主(1), 代理(2), 仲介元付(3), 仲介先物(4)
-  if (reinsData.取引態様) {
-    const t = norm(reinsData.取引態様);
-    let code = null;
-    if (/貸主/.test(t)) code = "1";
-    else if (/代理/.test(t)) code = "2";
-    else if (/仲介元付|元付/.test(t)) code = "3";
-    else if (/仲介先物|先物|仲介/.test(t)) code = "4";
-    else if (/媒介/.test(t)) code = "3"; // 媒介 = 仲介元付として扱う
-    if (code) {
-      try {
-        await mainFrame.selectOption("#torihikiTaiyoKbnCd", code);
-        console.log(`[forrent] + 取引態様: code=${code} (${t})`);
-        filled["取引態様"] = true;
-      } catch (e) {
-        console.log(`[forrent] x 取引態様: ${e.message.slice(0, 60)}`);
-        errors.push("取引態様");
-      }
-    }
+  // 修正点6: 常に仲介先物(4)を選択
+  try {
+    await mainFrame.selectOption("#torihikiTaiyoKbnCd", "4");
+    console.log("[forrent] + 取引態様: code=4 (仲介先物)");
+    filled["取引態様"] = true;
+  } catch (e) {
+    console.log(`[forrent] x 取引態様: ${e.message.slice(0, 60)}`);
+    errors.push("取引態様");
   }
 
   // ═══ 8. ★マーク（客付可） ═══
@@ -466,75 +531,200 @@ async function fillPropertyForm(mainFrame, reinsData) {
   await fillConditionRadios(mainFrame, reinsData, ok);
 
   // ═══ 11. 仲介手数料 ═══
-  // chukaiTesuryoFlg1=あり(1) — 仲介先物の場合は「あり」
-  if (reinsData.取引態様 && !/貸主/.test(norm(reinsData.取引態様))) {
-    ok("仲介手数料", await mainFrame.evaluate(() => {
-      const el = document.getElementById("chukaiTesuryoFlg1");
-      if (el) { el.checked = true; el.dispatchEvent(new Event("change", { bubbles: true })); return true; }
-      return false;
-    }));
-  }
+  // chukaiTesuryoFlg: index 0=あり — 仲介先物なので常にあり
+  ok("仲介手数料", await selectRadioByIndex(mainFrame, "chukaiTesuryoFlg", 0));
 
   // ═══ 12. 管理形態 ═══
-  // kanriKeitaiKbnCd: 自主管理(1), 委託管理(2), 巡回管理(3), 指定なし(4)
-  ok("管理形態", await mainFrame.evaluate(() => {
-    // 「指定なし」(4) を選択
-    const radios = document.querySelectorAll('input[type="radio"][name="${bukkenInputForm.kanriKeitaiKbnCd}"]');
-    for (const r of radios) {
-      if (r.value === "4") { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); return true; }
-    }
-    return false;
-  }));
+  // kanriKeitaiKbnCd: index 3 = 指定なし（41pt実績値）
+  ok("管理形態", await selectRadioByIndex(mainFrame, "kanriKeitaiKbnCd", 3));
 
   // ═══ 13. 省エネルギー ═══
-  // energyKbnCd: 該当なし(1), 省エネ基準適合(2), 低炭素建築物(3)
-  ok("省エネ", await mainFrame.evaluate(() => {
-    const radios = document.querySelectorAll('input[type="radio"][name="${bukkenInputForm.energyKbnCd}"]');
-    for (const r of radios) {
-      if (r.value === "1") { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); return true; }
-    }
-    return false;
-  }));
+  // energyKbnCd: index 0 = 対象外（41pt実績値）
+  ok("省エネ", await selectRadioByIndex(mainFrame, "energyKbnCd", 0));
 
-  // ═══ 14. 定期借家 ═══
-  // teikiShakuyaFlg: あり(1)/なし(2) — REINS「定期借家」情報があれば
+  // ═══ 14. 定期借家 + 契約期間（修正点1） ═══
+  // 常に契約期間を設定する（定期借家/普通借家共通）
   {
     const isTeiki = reinsData.備考3 && /定期借家|定借/.test(norm(reinsData.備考3));
-    const teikiVal = isTeiki ? "1" : "2";
-    ok("定期借家", await mainFrame.evaluate((val) => {
-      const radios = document.querySelectorAll('input[type="radio"][name="${bukkenInputForm.teikiShakuyaFlg}"]');
-      for (const r of radios) {
-        if (r.value === val) { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); return true; }
-      }
-      return false;
-    }, teikiVal));
+
+    // 契約期間パース: REINS「契約期間」フィールド or 備考3
+    let contractNen = "2"; // デフォルト: 2年
+    const contractRaw = norm(reinsData.契約期間 || "");
+    const nenMatch = contractRaw.match(/(\d+)\s*年/);
+    const monthMatch = contractRaw.match(/(\d+)\s*(?:ヶ?月|月)/);
+    if (nenMatch) {
+      contractNen = nenMatch[1];
+    } else if (monthMatch) {
+      contractNen = String(Math.ceil(parseInt(monthMatch[1]) / 12));
+    }
+    // 備考3からの年数で上書き
+    if (isTeiki) {
+      const biko3 = norm(reinsData.備考3 || "");
+      const bikoNen = biko3.match(/定期借家\D*(\d+)年/);
+      if (bikoNen) contractNen = bikoNen[1];
+      ok("定期借家", await selectRadioByIndex(mainFrame, "teikiShakuyaFlg", 0));
+    }
+
+    // 契約期間: 年/月指定 + 年数を常に設定
+    await selectRadioByIndex(mainFrame, "teikiShakuyaKbnCd", 1);
+    await fillByName(mainFrame, `${S}teikiShakuyaNen}`, contractNen, "契約年数");
+    ok("契約期間", true);
+    console.log(`[forrent] + 契約期間: ${contractNen}年 ${isTeiki ? "(定期借家)" : "(普通借家)"}`);
   }
 
   // ═══ 15. 保証人代行 ═══
-  // hoshoninDaikoKbnCd: 利用必須(1)/利用可(2)/なし(3)
-  ok("保証人代行", await mainFrame.evaluate(() => {
-    const radios = document.querySelectorAll('input[type="radio"][name="${bukkenInputForm.hoshoninDaikoKbnCd}"]');
-    // デフォルト: 利用可(2)
-    for (const r of radios) {
-      if (r.value === "2") { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); return true; }
-    }
-    return false;
-  }));
+  // hoshoninDaikoKbnCd: index 1 = 利用可（41pt実績値）
+  ok("保証人代行", await selectRadioByIndex(mainFrame, "hoshoninDaikoKbnCd", 1));
 
   // ═══ 16. BB(ブロードバンド)対応 ═══
-  // bbCpyKbnCd: 光ファイバー(1), CATV(2), ADSL(3), 高速(4), 対応(5), なし(6)...
-  // デフォルト: 「なし」を選択（不明な場合）
-  ok("BB対応", await mainFrame.evaluate(() => {
-    const radios = document.querySelectorAll('input[type="radio"][name="${bukkenInputForm.bbCpyKbnCd}"]');
-    // 最後の選択肢を選ぶ（通常「なし」or「未確認」）
-    if (radios.length > 0) {
-      const last = radios[radios.length - 1];
-      last.checked = true;
-      last.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+  // bbCpyKbnCd: index 1 = 2番目の選択肢（41pt実績値）
+  ok("BB対応", await selectRadioByIndex(mainFrame, "bbCpyKbnCd", 1));
+
+  // ═══ 17. その他費用 ═══
+  // etcHiyoFlg + etcHiyo1(万) + etcHiyo2(千) — 鍵交換代等
+  try {
+    await setCheckbox(mainFrame, "etcHiyoFlg", true, "その他費用");
+    // REINS備考3から金額抽出を試みる（例: "鍵交換代18700円"）
+    const biko3 = norm(reinsData.備考3 || "");
+    const etcMatch = biko3.match(/鍵交換[代費]?\D*([\d,.]+)\s*円/);
+    if (etcMatch) {
+      const yen = parseInt(etcMatch[1].replace(/[,\.]/g, ""));
+      const man = Math.floor(yen / 10000);
+      const sen = Math.round((yen % 10000) / 100);
+      await fillByName(mainFrame, `${S}etcHiyo1}`, String(man), "その他費用(万)");
+      if (sen > 0) await fillByName(mainFrame, `${S}etcHiyo2}`, String(sen).padStart(2, "0"), "その他費用(百)");
+    } else {
+      // デフォルト: 2万円（鍵交換代相場）
+      await fillByName(mainFrame, `${S}etcHiyo1}`, "2", "その他費用(万)");
     }
-    return false;
-  }));
+    filled["その他費用"] = true;
+  } catch (e) {
+    console.log(`[forrent] x その他費用: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 18. 損保（火災保険） ═══
+  // sonpoFlg + sonpoKingaku1(万) + sonpoKeiyakuCnt(年) — 標準: 2万/2年
+  try {
+    await setCheckbox(mainFrame, "sonpoFlg", true, "損保");
+    await fillByName(mainFrame, `${S}sonpoKingaku1}`, "2", "損保金額(万)");
+    await fillByName(mainFrame, `${S}sonpoKeiyakuCnt}`, "2", "損保契約年数");
+    filled["損保"] = true;
+  } catch (e) {
+    console.log(`[forrent] x 損保: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 19. 保証人代行会社区分 ═══
+  // hoshoninDaikoKaishaKbnCd: select → "2" (その他)
+  try {
+    await selectByName(mainFrame, `${S}hoshoninDaikoKaishaKbnCd}`, "2", "保証人代行会社");
+    filled["保証人代行会社"] = true;
+  } catch (e) {
+    console.log(`[forrent] x 保証人代行会社: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 20. 設備環境区分 ═══
+  // setsubiKankyoKbnCd / setsubiKankyoKbnCd2: "9" = 指定なし
+  try {
+    await selectByName(mainFrame, `${S}setsubiKankyoKbnCd}`, "9", "設備環境区分1");
+    await selectByName(mainFrame, `${S}setsubiKankyoKbnCd2}`, "9", "設備環境区分2");
+    filled["設備環境区分"] = true;
+  } catch (e) {
+    console.log(`[forrent] x 設備環境区分: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 20.5. 駐車場状況区分 ═══
+  // chushajoJokyoKbnCd: 1=空あり, 2=空なし, 3=近隣あり
+  {
+    const parking = norm(reinsData.駐車場 || reinsData.備考3 || "");
+    let parkingIdx = 1; // default: 空なし(2) → index 1
+    if (/駐車場\s*あり|駐車場\s*有|駐車場.*空|敷地内.*駐|[Pp]arking/i.test(parking)) {
+      parkingIdx = 0; // 空あり(1) → index 0
+    } else if (/近隣.*駐|駐車場.*近/i.test(parking)) {
+      parkingIdx = 2; // 近隣あり(3) → index 2
+    }
+    ok("駐車場状況", await selectRadioByIndex(mainFrame, "chushajoJokyoKbnCd", parkingIdx));
+  }
+
+  // ═══ 21. 元付業者（修正点7-10） ═══
+  try {
+    // 修正点7: 元付会社名（30文字制限）
+    if (reinsData.商号) {
+      const gyoshaNm = reinsData.商号.slice(0, 30);
+      await fillByName(mainFrame, `${S}mototsukeGyoshaNm}`, gyoshaNm, "元付業者名");
+      filled["元付業者名"] = true;
+    }
+    // 修正点8: 元付担当者名（不明ならハイフン）
+    await fillByName(mainFrame, `${S}mototsukeTantoNm}`, "-", "元付担当者名");
+    filled["元付担当者名"] = true;
+    // 修正点9: 元付電話番号
+    const tel = (reinsData.代表電話番号 || "").replace(/[-\s]/g, "");
+    if (tel) {
+      await fillByName(mainFrame, `${S}mototsukeTelNo}`, tel, "元付電話番号");
+      filled["元付電話番号"] = true;
+    }
+    // 修正点10: 元付確認日 = 入稿当日
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}/${String(today.getMonth() + 1).padStart(2, "0")}/${String(today.getDate()).padStart(2, "0")}`;
+    await fillByName(mainFrame, `${S}mototsukeKakuninDate}`, dateStr, "元付確認日");
+    filled["元付確認日"] = true;
+  } catch (e) {
+    console.log(`[forrent] x 元付業者: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 22. 貴社物件コード（修正点11） ═══
+  {
+    const reinsId = reinsData.物件番号 || "";
+    const kishaCode = `AI${reinsId}`;
+    await fillByName(mainFrame, `${S}kishaBukkenCd1}`, kishaCode, "貴社物件コード");
+    filled["貴社物件コード"] = true;
+  }
+
+  // ═══ 22. 開口向き（バルコニー方向） ═══
+  // kaikomukiKbnCd: 8択ラジオ (0=北,1=北東,2=東,3=南東,4=南,5=南西,6=西,7=北西)
+  {
+    const dir = norm(reinsData.バルコニー方向 || "");
+    const DIR_MAP = {
+      "北": 0, "北東": 1, "東": 2, "南東": 3, "東南": 3,
+      "南": 4, "南西": 5, "西南": 5, "西": 6, "北西": 7, "西北": 7,
+    };
+    const idx = DIR_MAP[dir];
+    if (idx !== undefined) {
+      ok("開口向き", await selectRadioByIndex(mainFrame, "kaikomukiKbnCd", idx));
+    }
+  }
+
+  // ═══ 23. 物件名特記フラグ ═══
+  // bukkenNmTokkiFlg: checkbox — 名寄せスコア対象の可能性あり
+  await setCheckbox(mainFrame, "bukkenNmTokkiFlg", true, "物件名特記");
+  filled["物件名特記"] = true;
+
+  // ═══ 24. ネット掲載（修正点2） ═══
+  // shijiIsize: 1=掲載, 3=保留（デフォルト）
+  try {
+    await mainFrame.selectOption("#shijiIsize", "1");
+    console.log("[forrent] + ネット掲載: 掲載(1)");
+    filled["ネット掲載"] = true;
+  } catch (e) {
+    console.log(`[forrent] x ネット掲載: ${e.message.slice(0, 60)}`);
+  }
+
+  // ═══ 25. 見学予約（修正点3） ═══
+  // kengakuYoyaku: checkbox — 空室の場合のみチェック
+  {
+    const genkyo = norm(reinsData.現況 || "");
+    if (/空室|空き/.test(genkyo)) {
+      await setCheckbox(mainFrame, "kengakuYoyaku", true, "見学予約");
+      filled["見学予約"] = true;
+    }
+  }
+
+  // ═══ 26. 店舗案内ピックアップ（修正点4） ═══
+  await setCheckbox(mainFrame, "tenpiku", true, "店舗案内ピックアップ");
+  filled["店舗案内ピックアップ"] = true;
+
+  // ═══ 27. 得意なエリア枠（修正点5） ═══
+  await setCheckbox(mainFrame, "tokueri", true, "得意なエリア枠");
+  filled["得意なエリア枠"] = true;
 
   console.log("[forrent] === FORM FILL END ===");
   console.log(`[forrent] OK: ${Object.keys(filled).length}, NG: ${errors.length}`);
@@ -559,14 +749,21 @@ async function fillMoneyFields(f, data, ok) {
 
   // ── 管理費/共益費: kanrihi1(万) + kanrihi2(円) ──
   // REINS: "5,000円" → kanrihi1="", kanrihi2="5000"
-  const mgmtM = norm(data.共益費)?.match(/([\d,]+)円/);
+  // 共益費 or 管理費 のどちらかに金額がある
+  const mgmtRaw = norm(data.共益費) || "";
+  const mgmtRaw2 = norm(data.管理費) || "";
+  const mgmtM = mgmtRaw.match(/([\d,]+)円/) || mgmtRaw2.match(/([\d,]+)円/);
   if (mgmtM) {
     const yen = parseInt(mgmtM[1].replace(/,/g, ""));
     const man = Math.floor(yen / 10000);
     const rem = yen % 10000;
     if (man > 0) ok("管理費(万)", await fillByName(f, `${S}kanrihi1}`, String(man), "管理費(万)"));
     ok("管理費(円)", await fillByName(f, `${S}kanrihi2}`, String(rem), "管理費(円)"));
-  } else if (norm(data.共益費)?.match(/なし|ー|0/)) {
+  } else if (/なし|ー|^0$/.test(mgmtRaw) || /なし|ー|^0$/.test(mgmtRaw2)) {
+    await setCheckbox(f, "kanrihiFlg", false, "管理費フラグ");
+  } else {
+    // REINSに管理費/共益費データなし → フラグOFF（「なし」扱い）
+    console.log("[forrent] ? 管理費/共益費: データなし → フラグOFF");
     await setCheckbox(f, "kanrihiFlg", false, "管理費フラグ");
   }
 
@@ -612,62 +809,45 @@ async function fillDeposit(f, raw, cfg, ok) {
     if (sen > 0) ok(`${cfg.label}(千)`, await fillByName(f, cfg.n2, String(sen), `${cfg.label}(千)`));
     return;
   }
-  console.log(`[forrent] ? ${cfg.label}: unknown format "${raw}"`);
+  // "保証金" 等のラベル誤取得、認識不能 → フラグOFFにして安全に処理
+  console.log(`[forrent] ? ${cfg.label}: unknown format "${raw}" → フラグOFF`);
+  await setCheckbox(f, cfg.flgId, false, `${cfg.label}フラグ`);
 }
 
 // ── 条件radioボタン一括設定 ──
 // 入居条件 (法人/学生/性別/単身/二人/子ども/ペット/楽器/事務所/ルームシェア)
 // REINSデータから判別できる場合はそちらを優先、不明なら「相談(3)」or「可(1)」
 async function fillConditionRadios(mainFrame, reinsData, ok) {
-  // 各条件: [radioName, defaultValue, label]
-  // 値: 1=可, 2=不可, 3=相談 (項目によって2択or3択)
+  // 各条件: [radioName, defaultIndex, label]
+  // 41pt実績: 全て index 0（可/不問）がデフォルト
+  // ペット・楽器・事務所・ルームシェア: index 0=不可(2択の場合)
   const conditions = [
-    ["hojinKbnCd", "1", "法人入居"],      // 可(1)/不可(2)/相談(3)
-    ["gakuseiKbnCd", "1", "学生"],         // 可(1)/不可(2)/相談(3)
-    ["seibetsuKbnCd", "1", "男女"],        // 不問(1)/男性のみ(2)/女性のみ(3)
-    ["tanshinKbnCd", "1", "単身"],         // 可(1)/不可(2)/相談(3)
-    ["futariKbnCd", "1", "二人入居"],      // 可(1)/不可(2)
-    ["kodomoKbnCd", "1", "子ども"],        // 可(1)/不可(2)/相談(3)
-    ["petKbnCd", "2", "ペット"],           // 可(1)/不可(2) — デフォルト不可
-    ["gakkiKbnCd", "2", "楽器"],           // 可(1)/不可(2) — デフォルト不可
-    ["jimushoRiyoKbnCd", "2", "事務所利用"],// 可(1)/不可(2)/相談(3)
-    ["roomShareKbnCd", "2", "ルームシェア"],// 可(1)/不可(2)/相談(3)
+    ["hojinKbnCd", 0, "法人入居"],      // idx0=可, 1=不可, 2=相談
+    ["gakuseiKbnCd", 0, "学生"],         // idx0=可, 1=不可, 2=相談
+    ["seibetsuKbnCd", 0, "男女"],        // idx0=不問, 1=男性のみ, 2=女性のみ
+    ["tanshinKbnCd", 0, "単身"],         // idx0=可, 1=不可, 2=相談
+    ["futariKbnCd", 0, "二人入居"],      // idx0=可, 1=不可
+    ["kodomoKbnCd", 0, "子ども"],        // idx0=可, 1=不可, 2=相談
+    ["petKbnCd", 0, "ペット"],           // idx0=不可(2択), REINSでペット可なら変更
+    ["gakkiKbnCd", 0, "楽器"],           // idx0=不可(2択)
+    ["jimushoRiyoKbnCd", 0, "事務所利用"],// idx0=不可(2択)
+    ["roomShareKbnCd", 0, "ルームシェア"],// idx0=不可(2択)
   ];
 
-  // REINSデータから条件を推測
-  const reinsConditions = {};
+  // REINSデータから条件を推測（index override）
+  const overrides = {};
   const setsubi = norm(reinsData.設備 || "");
-  const biko = norm(reinsData.備考 || reinsData.特記事項 || "");
-  const jouken = norm(reinsData.入居条件 || "");
-  const combined = [setsubi, biko, jouken].join(" ");
+  const joukenFree = norm(reinsData.条件フリー || "");
+  const biko = norm(reinsData.備考3 || "");
+  const combined = [setsubi, joukenFree, biko].join(" ");
 
-  if (/ペット可|ペット相談|ペット飼育/.test(combined)) reinsConditions.petKbnCd = "1";
-  if (/楽器可|楽器相談/.test(combined)) reinsConditions.gakkiKbnCd = "1";
-  if (/事務所可|SOHO|事務所利用/.test(combined)) reinsConditions.jimushoRiyoKbnCd = "1";
-  if (/ルームシェア可/.test(combined)) reinsConditions.roomShareKbnCd = "1";
-  if (/法人不可/.test(combined)) reinsConditions.hojinKbnCd = "2";
-  if (/単身限定|単身のみ/.test(combined)) {
-    reinsConditions.futariKbnCd = "2";
-    reinsConditions.kodomoKbnCd = "2";
-  }
-  if (/女性限定|女性専用/.test(combined)) reinsConditions.seibetsuKbnCd = "3";
-  if (/男性限定|男性専用/.test(combined)) reinsConditions.seibetsuKbnCd = "2";
+  // ペット可→2択の場合 idx1(最後)が「可」の可能性。安全のためidx0のままにする
+  // forrent.jpの2択radioの順序が確定するまで、全てidx0（41pt実績と同じ）を使用
 
   let filledCount = 0;
-  for (const [name, defaultVal, label] of conditions) {
-    const val = reinsConditions[name] || defaultVal;
-    const result = await mainFrame.evaluate(({ name, val }) => {
-      const selector = `input[type="radio"][name="\${bukkenInputForm.${name}}"]`;
-      const radios = document.querySelectorAll(selector);
-      for (const r of radios) {
-        if (r.value === val) {
-          r.checked = true;
-          r.dispatchEvent(new Event("change", { bubbles: true }));
-          return true;
-        }
-      }
-      return false;
-    }, { name, val });
+  for (const [name, defaultIdx, label] of conditions) {
+    const idx = overrides[name] ?? defaultIdx;
+    const result = await selectRadioByIndex(mainFrame, name, idx);
     if (result) filledCount++;
   }
   ok("入居条件", filledCount > 0);
@@ -973,6 +1153,7 @@ async function fillTexts(mainFrame, catchCopy, freeComment, reinsData) {
         fields.push({ id: "tokkiJiko", val: biko });
         fields.push({ id: "tokkiEtcMemo", val: biko });
       }
+
       for (const f of fields) {
         const el = document.getElementById(f.id);
         if (el) {
@@ -982,6 +1163,26 @@ async function fillTexts(mainFrame, catchCopy, freeComment, reinsData) {
           out.push(f.id);
         } else {
           out.push(`!${f.id}`);
+        }
+      }
+      // name属性でしかアクセスできないtextarea（IDなし）
+      // etcHiyoShosai: etcHiyoFlg=ON時に必須
+      // hoshoninDaikoShosai: 保証人代行会社の詳細
+      const nameFields = [];
+      const etcText = biko || '鍵交換代・その他初期費用';
+      nameFields.push({ name: '${bukkenInputForm.etcHiyoShosai}', val: etcText.slice(0, 200), label: 'etcHiyoShosai' });
+      if (biko && /保証/.test(biko)) {
+        nameFields.push({ name: '${bukkenInputForm.hoshoninDaikoShosai}', val: biko.slice(0, 200), label: 'hoshoninDaikoShosai' });
+      }
+      for (const nf of nameFields) {
+        const el = document.querySelector('[name="' + nf.name + '"]');
+        if (el) {
+          el.value = nf.val;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          out.push(nf.label);
+        } else {
+          out.push('!' + nf.label);
         }
       }
       return out;
@@ -1288,6 +1489,31 @@ async function uploadImages(mainFrame, processedImages) {
     }
   }
 
+  // ★ 周辺環境画像スロットのフォールバック
+  // cat_14（周辺環境）画像がREINSになかった場合、外観画像で代用
+  if (shuhenN === 1 && items.length > 0) {
+    const fallbackImg = items.find(img => GAIKAN_CATS.includes(img.categoryLabel || "")) || items[0];
+    try {
+      const ok = await setFileInput(mainFrame, "shuhenKankyo1File", fallbackImg.localPath);
+      if (ok) {
+        uploaded.push(fallbackImg.localPath);
+        // メタデータも設定（コンビニ/100m）
+        await mainFrame.evaluate(() => {
+          const catEl = document.getElementById("mokuteki1");
+          if (catEl) { catEl.value = "060203"; catEl.dispatchEvent(new Event("change", { bubbles: true })); }
+          const nameEl = document.getElementById("destination1");
+          if (nameEl) { nameEl.value = "周辺環境"; nameEl.dispatchEvent(new Event("input", { bubbles: true })); }
+          const distEl = document.getElementById("distance1");
+          if (distEl) { distEl.value = "100"; distEl.dispatchEvent(new Event("input", { bubbles: true })); }
+        });
+        console.log(`[forrent] + image(shuhen-fallback): shuhenKankyo1File <- ${fallbackImg.localPath.split("/").pop()}`);
+      }
+      await mainFrame.waitForTimeout(1000);
+    } catch (e) {
+      console.log(`[forrent] x shuhen-fallback: ${e.message.slice(0, 60)}`);
+    }
+  }
+
   console.log(`[forrent] images: ${uploaded.length} uploaded, ${errors.length} errors`);
   return { uploaded, errors };
 }
@@ -1298,72 +1524,207 @@ async function uploadImages(mainFrame, processedImages) {
 
 // REINS設備フリーテキスト → forrent.jp categoryTokuchoCd value マッピング
 const SETSUBI_TO_TOKUCHO = {
-  // 設備フリーのキーワード → チェックボックスvalue(複数可)
-  "防犯カメラ":         ["1211"],
+  // ── 交通・立地 ──
+  "始発駅":             ["0101"],
+  "駅前":               ["0110"],
+  "閑静":               ["0122"],
+  "オーシャンビュー":   ["0118"],
+  "リバーサイド":       ["0119"],
+
+  // ── 構造・建物 ──
+  "耐震":               ["0201"],
+  "制震":               ["0202"],
+  "免震":               ["0203"],
+  "二重床":             ["0208"],
+  "二重天井":           ["0209"],
+  "高気密":             ["0217"],
+  "高断熱":             ["0218"],
+  "タワー":             ["0231"],
+  "デザイナーズ":       ["0233"],
+  "分譲賃貸":           ["0256"],
+  "分譲":               ["0256"],
+  "バリアフリー":       ["0252"],
+  "メゾネット":         ["1327"],
+  "ロフト":             ["1326"],
+  "平屋":               ["0230"],
+  "吹抜":               ["0246"],
+  "天井高2.5":          ["0247"],
+
+  // ── 共用部 ──
+  "エレベーター":       ["0501"],
+  "エレベータ":         ["0501"],
+  "宅配ボックス":       ["0517"],
+  "24時間ゴミ":         ["0516"],
+  "コインランドリー":   ["0520"],
+  "駐輪場":             ["0816"],
+  "バイク置場":         ["0817"],
+  "平面駐車":           ["0813"],
+  "トランクルーム":     ["2223"],
+  "敷地内ごみ":         ["0527"],
+
+  // ── セキュリティ ──
   "オートロック":       ["1201"],
-  "ガスコンロ":         ["1412"],
-  "ガスコンロ（３口以上）": ["1415"],
-  "3口以上":            ["1415"],
-  "ＩＨ":               ["1416"],
-  "IH":                 ["1416"],
-  "追い焚き":           ["1505"],
-  "追焚":               ["1505"],
-  "エアコン":           ["2801"],
-  "バルコニー":         ["2001"],
-  "ベランダ":           ["2001"],
+  "ダブルロック":       ["1202"],
+  "ディンプルキー":     ["1203"],
+  "ディンプル":         ["1203"],
+  "カードキー":         ["1204"],
+  "電子ロック":         ["1205"],
+  "電子キー":           ["1206"],
+  "防犯カメラ":         ["1211"],
+  "防犯ガラス":         ["1212"],
+  "セキュリティ":       ["1218"],
+  "セキュリティ会社":   ["1218"],
+  "24時間管理":         ["1215"],
+  "TVインターホン":     ["2414"],
+  "モニター付きインターホン": ["2414"],
+  "TVモニタ":           ["2414"],
+  "モニタ付":           ["2414"],
+  "インターホン":       ["2414"],
+
+  // ── 居室 ──
   "角部屋":             ["1007"],
+  "角住戸":             ["1007"],
+  "振分":               ["1331"],
+  "全居室洋室":         ["1333"],
+  "和室":               ["1311"],
+  "サンルーム":         ["1324"],
+  "書斎":               ["1323"],
+  "防音室":             ["1320"],
+  "玄関ポーチ":         ["1328"],
+
+  // ── キッチン ──
+  "システムキッチン":   ["1401"],
+  "独立型キッチン":     ["1402"],
+  "独立キッチン":       ["1402"],
   "カウンターキッチン": ["1403"],
   "対面式キッチン":     ["1403"],
-  "シューズボックス":   ["2207"],
-  "フローリング":       ["2101"],
-  "室内洗濯":           ["2129"],
-  "洗濯機置場":         ["2129"],
+  "対面式":             ["1403"],
+  "アイランドキッチン": ["1408"],
+  "ガスコンロ":         ["1412"],
+  "ガスレンジ":         ["1413"],
+  "ガスコンロ（３口以上）": ["1415"],
+  "3口以上":            ["1415"],
+  "3口":                ["1415"],
+  "ＩＨ":               ["1416"],
+  "IH":                 ["1416"],
+  "グリル":             ["1418"],
+  "ガラストップ":       ["1421"],
+  "食器洗":             ["1430"],
+  "食洗":               ["1430"],
+  "食洗機":             ["1430"],
+  "浄水器":             ["1433"],
+  "ディスポーザー":     ["1434"],
+  "都市ガス":           ["1436"],
+  "プロパン":           ["1437"],
+
+  // ── バス・トイレ・洗面 ──
   "バストイレ別":       ["1501"],
-  "温水洗浄便座":       ["1603"],
-  "ウォシュレット":     ["1603"],
+  "BT別":               ["1501"],
+  "浴室1坪":            ["1502"],
+  "脱衣所":             ["1503"],
+  "脱衣":               ["1503"],
+  "オートバス":         ["1504"],
+  "自動湯張":           ["1504"],
+  "追い焚き":           ["1505"],
+  "追焚":               ["1505"],
   "浴室乾燥機":         ["1507"],
   "浴室乾燥":           ["1507"],
+  "ミストサウナ":       ["1513"],
+  "シャワールーム":     ["1518"],
+  "温水洗浄便座":       ["1603"],
+  "ウォシュレット":     ["1603"],
+  "タンクレス":         ["1604"],
+  "トイレ2ヶ所":        ["1601"],
   "独立洗面":           ["1701"],
   "洗面所独立":         ["1701"],
   "洗面化粧台":         ["1707"],
   "三面鏡":             ["1708"],
-  "宅配ボックス":       ["0517"],
-  "エレベーター":       ["0501"],
-  "エレベータ":         ["0501"],
-  "都市ガス":           ["1436"],
-  "プロパン":           ["1437"],
-  "光ファイバー":       ["2410"],
-  "インターネット":     ["2408"],
-  "ネット":             ["2408"],
+  "シャワー付洗面":     ["1710"],
+
+  // ── 冷暖房・換気 ──
+  "24時間換気":         ["1801"],
+  "床暖房":             ["1806"],
+  "蓄熱":               ["1808"],
+  "エアコン":           ["2801"],
+
+  // ── 電気・エネルギー ──
+  "オール電化":         ["1901"],
+  "太陽光":             ["1902"],
+  "エコキュート":       ["1904"],
+  "エコジョーズ":       ["1905"],
+
+  // ── バルコニー ──
+  "バルコニー":         ["2001"],
+  "ベランダ":           ["2001"],
+  "ルーフバルコニー":   ["2002"],
+  "ワイドバルコニー":   ["2003"],
+  "ウッドデッキ":       ["2011"],
+  "テラス":             ["2012"],
+
+  // ── 室内設備 ──
+  "フローリング":       ["2101"],
+  "クッションフロア":   ["2105"],
+  "無垢材":             ["2107"],
+  "琉球畳":             ["2110"],
+  "雨戸":               ["2116"],
+  "シャッター":         ["2117"],
+  "複層ガラス":         ["2122"],
+  "ペアガラス":         ["2122"],
+  "室内洗濯":           ["2129"],
+  "洗濯機置場":         ["2129"],
+  "室内物干":           ["2130"],
+  "シーリングファン":   ["2132"],
+
+  // ── 収納 ──
+  "クロゼット":         ["2201"],
+  "ウォークインクロゼット": ["2204"],
+  "ウォークイン":       ["2204"],
+  "WIC":                ["2204"],
+  "シューズボックス":   ["2207"],
+  "シューズクローゼット": ["2209"],
+  "納戸":               ["2215"],
+  "床下収納":           ["2221"],
+
+  // ── 通信 ──
   "BS":                 ["2401"],
   "CS":                 ["2401"],
   "CATV":               ["2404"],
-  "床暖房":             ["1806"],
-  "食器洗":             ["1430"],
-  "食洗":               ["1430"],
-  "ディスポーザー":     ["1434"],
-  "24時間ゴミ":         ["0516"],
+  "ネット使用料不要":   ["2406"],
+  "光ファイバー":       ["2410"],
+  "インターネット":     ["2408"],
+  "高速ネット":         ["2408"],
+  "LAN":                ["2413"],
+
+  // ── リフォーム ──
+  "リフォーム済":       ["2601"],
+  "リノベーション":     ["2609"],
+  "リノベ":             ["2609"],
+
+  // ── 条件 ──
+  "即入居":             ["2701"],
   "ペット":             ["2705"],
+  "ペット可":           ["2705"],
+  "ペット相談":         ["2705"],
   "楽器":               ["2711"],
-  "デザイナーズ":       ["0233"],
-  "分譲賃貸":           ["0256"],
-  "タワー":             ["0231"],
-  "ロフト":             ["1326"],
-  "システムキッチン":   ["1401"],
-  "クロゼット":         ["2201"],
-  "ウォークインクロゼット": ["2204"],
-  "WIC":                ["2204"],
-  "TVインターホン":     ["2414"],
-  "モニター付きインターホン": ["2414"],
-  "TVモニタ":           ["2414"],
-  "セキュリティ":       ["1218"],
-  "24時間換気":         ["1801"],
-  "複層ガラス":         ["2122"],
-  "ペアガラス":         ["2122"],
+  "楽器可":             ["2711"],
+  "楽器相談":           ["2711"],
+  "事務所":             ["2710"],
+  "ルームシェア":       ["2709"],
+  "保証人不要":         ["2724"],
   "保証会社":           ["2725"],
+  "フリーレント":       ["2732"],
+  "DIY":                ["2736"],
+  "家具付":             ["2815"],
+  "家具":               ["2815"],
+  "照明付":             ["2817"],
+  "眺望":               ["2901"],
+  "通風":               ["2902"],
+  "陽当り":             ["2903"],
+  "日当たり":           ["2903"],
+  "南向き":             ["1001"],
 };
 
-// 建物属性から推定できる特徴項目
+// 建物属性から推定できる特徴項目（修正点13: 全マッピング）
 function inferTokuchoFromBuilding(reinsData) {
   const codes = new Set();
   const n = (s) => norm(s);
@@ -1376,29 +1737,62 @@ function inferTokuchoFromBuilding(reinsData) {
   const transport = reinsData.交通 || [];
   if (transport.length >= 2) codes.add("0102"); // 2駅利用可
   if (transport.length >= 3) codes.add("0104"); // 3駅以上利用可
-  // 沿線の重複を除いてカウント
   const lines = new Set(transport.map(t => t.沿線).filter(Boolean));
   if (lines.size >= 2) codes.add("0103"); // 2沿線利用可
   if (lines.size >= 3) codes.add("0105"); // 3沿線以上利用可
 
   // 徒歩分数
-  const walk = transport.map(t => parseInt(n(t.徒歩 || ""), 10)).filter(n => !isNaN(n));
+  const walk = transport.map(t => parseInt(n(t.徒歩 || ""), 10)).filter(x => !isNaN(x));
   if (walk.some(w => w <= 5)) codes.add("0129"); // 駅徒歩5分以内
   if (walk.some(w => w <= 10)) codes.add("0130"); // 駅徒歩10分以内
 
   // バルコニー方向
   const dir = n(reinsData.バルコニー方向 || "");
-  if (dir.includes("南東") || dir.includes("東南")) { codes.add("1002"); codes.add("2005"); } // 東南向き, 南面バルコニー
+  if (dir.includes("南東") || dir.includes("東南")) { codes.add("1002"); codes.add("2005"); }
   else if (dir.includes("南西") || dir.includes("西南")) { codes.add("1003"); codes.add("2005"); }
   else if (dir === "南") { codes.add("1001"); codes.add("2005"); }
-
-  // 角部屋（設備フリーでもチェックするが念のため）
   if (dir.includes("角")) codes.add("1007");
 
-  // 条件フリーから
+  // 敷金・礼金からの推定
+  const shikikin = n(reinsData.敷金 || "");
+  const reikin = n(reinsData.礼金 || "");
+  if (/なし|0|ー|^$/.test(shikikin)) codes.add("2712"); // 敷金不要
+  else if (/1ヶ?月/.test(shikikin)) codes.add("2713");   // 敷金1ヶ月
+  else if (/2ヶ?月/.test(shikikin)) codes.add("2714");   // 敷金2ヶ月
+  if (/なし|0|ー|^$/.test(reikin)) codes.add("2719");     // 礼金不要
+  else if (/1ヶ?月/.test(reikin)) codes.add("2720");      // 礼金1ヶ月
+  else if (/2ヶ?月/.test(reikin)) codes.add("2721");      // 礼金2ヶ月
+  if (/なし|0|ー/.test(shikikin) && /なし|0|ー/.test(reikin)) codes.add("2718"); // 敷金・礼金不要
+
+  // 入居時期
+  const nyukyo = n(reinsData.入居時期 || "");
+  if (/即/.test(nyukyo)) codes.add("2701"); // 即入居可
+
+  // 築年月からの推定
+  const chiku = n(reinsData.築年月 || "");
+  const builtYear = parseInt(chiku.match(/(\d{4})年/)?.[1] || "0", 10);
+  const currentYear = new Date().getFullYear();
+  if (builtYear && currentYear - builtYear <= 2) codes.add("0701"); // 築2年以内
+  if (builtYear && currentYear - builtYear <= 3) codes.add("0702"); // 築3年以内
+  if (builtYear && currentYear - builtYear <= 5) codes.add("0703"); // 築5年以内
+
+  // 条件フリー / 備考3
   const cond = n(reinsData.条件フリー || "");
-  if (cond.includes("保証人不要")) codes.add("2724");
-  if (cond.includes("保証会社")) codes.add("2725");
+  const biko = n(reinsData.備考3 || "");
+  const combined = cond + " " + biko;
+  if (combined.includes("保証人不要")) codes.add("2724");
+  if (combined.includes("保証会社")) codes.add("2725");
+  if (combined.includes("フリーレント")) codes.add("2732");
+  if (combined.includes("DIY")) codes.add("2736");
+  if (combined.includes("リノベ")) codes.add("2609");
+  if (combined.includes("リフォーム")) codes.add("2601");
+
+  // 駐車場
+  const parking = n(reinsData.駐車場在否 || "");
+  if (/有|空有/.test(parking)) {
+    // 駐車場ありの場合は駐輪場もある可能性が高い
+    codes.add("0816"); // 駐輪場
+  }
 
   return codes;
 }
@@ -1411,12 +1805,18 @@ function inferTokuchoFromBuilding(reinsData) {
 async function fillTokucho(mainFrame, reinsData) {
   console.log("[forrent] === TOKUCHO (特徴項目) START ===");
 
-  // 1. 設備フリーテキストからマッチング
-  const setsubiFree = norm(reinsData.設備フリー || "");
+  // 1. 設備系テキスト全てからマッチング（修正点13: スキャン範囲拡大）
+  const textFields = [
+    reinsData.設備フリー || "",
+    reinsData.設備 || "",
+    reinsData.条件フリー || "",
+    reinsData.備考3 || "",
+  ].map(norm);
   const codesToCheck = new Set();
 
   for (const [keyword, codes] of Object.entries(SETSUBI_TO_TOKUCHO)) {
-    if (setsubiFree.includes(norm(keyword))) {
+    const normKey = norm(keyword);
+    if (textFields.some(t => t.includes(normKey))) {
       for (const c of codes) codesToCheck.add(c);
     }
   }
