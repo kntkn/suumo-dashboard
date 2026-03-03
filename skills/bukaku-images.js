@@ -114,8 +114,8 @@ const ITANDI = {
   loginUrl: "https://itandi-accounts.com/login",
   homeUrl: "https://itandibb.com/top",
   searchUrl: "https://itandibb.com/rent_rooms/list",
-  email: "info@fun-t.jp",
-  password: "funt0406",
+  email: process.env.ITANDI_EMAIL,
+  password: process.env.ITANDI_PASSWORD,
 };
 
 async function itandiLogin(page) {
@@ -224,8 +224,8 @@ async function itandiGetImages(page, detailUrl) {
 const IELOVEBB = {
   loginUrl: "https://bb.ielove.jp/ielovebb/login/index",
   topUrl: "https://bb.ielove.jp/ielovebb/top/index/type/01/",
-  email: "goto@fun-t.jp",
-  password: "funt040600",
+  email: process.env.IELOVEBB_EMAIL,
+  password: process.env.IELOVEBB_PASSWORD,
 };
 
 async function ieloveBBLogin(page) {
