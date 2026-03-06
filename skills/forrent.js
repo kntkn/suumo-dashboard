@@ -15,6 +15,10 @@
  * 8. 画像: 外観(gaikan), パース(perth), 室内(shitsunai), 写真1-3, 追加画像1-8
  */
 
+const sharp = require("sharp");
+const fs = require("fs");
+const path = require("path");
+
 // ── URLs & Selectors ──
 
 const FORRENT_URLS = {
@@ -603,20 +607,43 @@ async function fillPropertyForm(mainFrame, reinsData) {
   }
 
   // ═══ 18. 損保（火災保険） ═══
-  // sonpoFlg + sonpoKingaku1(万) + sonpoKeiyakuCnt(年) — 標準: 2万/2年
+  // sonpoFlg checkbox → wait for dependent fields → fill amount/years
   try {
     await setCheckbox(mainFrame, "sonpoFlg", true, "損保");
-    await fillByName(mainFrame, `${S}sonpoKingaku1}`, "2", "損保金額(万)");
-    await fillByName(mainFrame, `${S}sonpoKeiyakuCnt}`, "2", "損保契約年数");
+    await mainFrame.waitForTimeout(500); // wait for dependent fields to appear
+    // Try both name-based and ID-based access for amount/years
+    const sonpoOk = await mainFrame.evaluate(({ S }) => {
+      const out = [];
+      // sonpoKingaku1 — amount in 万
+      const k1 = document.querySelector(`[name="${S}sonpoKingaku1}"]`) || document.getElementById("sonpoKingaku1");
+      if (k1) { k1.value = "2"; k1.dispatchEvent(new Event("change", { bubbles: true })); out.push("金額"); }
+      // sonpoKeiyakuCnt — contract years
+      const cnt = document.querySelector(`[name="${S}sonpoKeiyakuCnt}"]`) || document.getElementById("sonpoKeiyakuCnt");
+      if (cnt) { cnt.value = "2"; cnt.dispatchEvent(new Event("change", { bubbles: true })); out.push("年数"); }
+      return out;
+    }, { S });
+    console.log(`[forrent] + 損保: ${sonpoOk.join(", ")} 設定完了`);
     filled["損保"] = true;
   } catch (e) {
     console.log(`[forrent] x 損保: ${e.message.slice(0, 60)}`);
   }
 
   // ═══ 19. 保証人代行会社区分 ═══
-  // hoshoninDaikoKaishaKbnCd: select → "2" (その他)
+  // hoshoninDaikoKaishaKbnCd: select → "2" (その他) + 保証会社名を常に入力
   try {
     await selectByName(mainFrame, `${S}hoshoninDaikoKaishaKbnCd}`, "2", "保証人代行会社");
+    await mainFrame.waitForTimeout(300);
+    // Extract guarantor company name from REINS biko/joukenFree
+    const bikoText = norm(reinsData.備考3 || "");
+    const joukenText = norm(reinsData.条件フリー || "");
+    const combinedText = bikoText + " " + joukenText;
+    // Try to extract specific company name
+    let hoshoCompany = "保証会社利用必須";
+    const companyMatch = combinedText.match(/(全保連|日本セーフティー?|日本セーフティ|Casa|CASA|カーサ|ジェイリース|オリコ|エポス|クレジット|ジャックス|アプラス|日本賃貸保証|フォーシーズ|エルズサポート|日商トレーディング|ナップ賃貸保証|大和リビング保証|レジデンシャルパートナーズ)/i);
+    if (companyMatch) {
+      hoshoCompany = companyMatch[1];
+    }
+    await fillByName(mainFrame, `${S}hoshoninDaikoShosai}`, hoshoCompany, "保証会社名");
     filled["保証人代行会社"] = true;
   } catch (e) {
     console.log(`[forrent] x 保証人代行会社: ${e.message.slice(0, 60)}`);
@@ -708,15 +735,58 @@ async function fillPropertyForm(mainFrame, reinsData) {
     console.log(`[forrent] x ネット掲載: ${e.message.slice(0, 60)}`);
   }
 
-  // ═══ 25. 見学予約（修正点3） ═══
-  // kengakuYoyaku: checkbox — 空室の場合のみチェック
-  {
-    const genkyo = norm(reinsData.現況 || "");
-    if (/空室|空き/.test(genkyo)) {
-      await setCheckbox(mainFrame, "kengakuYoyaku", true, "見学予約");
-      filled["見学予約"] = true;
+  // ═══ 24.5. スマピク掲載 ═══
+  // DOM search for SmaPic checkbox (ID/name varies)
+  try {
+    const smapicChecked = await mainFrame.evaluate(() => {
+      // Search by known patterns: sumapiku, smapiku, smapic, スマピク
+      const candidates = [
+        document.getElementById("sumapikuFlg"),
+        document.getElementById("smapikuFlg"),
+        document.querySelector('[name*="sumapiku"]'),
+        document.querySelector('[name*="smapiku"]'),
+        document.querySelector('[id*="sumapiku"]'),
+        document.querySelector('[id*="smapiku"]'),
+      ].filter(Boolean);
+      // Also search by label text
+      if (candidates.length === 0) {
+        const labels = document.querySelectorAll("label");
+        for (const label of labels) {
+          if (label.textContent.includes("スマピク")) {
+            const forId = label.getAttribute("for");
+            if (forId) {
+              const el = document.getElementById(forId);
+              if (el) candidates.push(el);
+            }
+            const cb = label.querySelector('input[type="checkbox"]');
+            if (cb) candidates.push(cb);
+          }
+        }
+      }
+      if (candidates.length > 0) {
+        const cb = candidates[0];
+        if (!cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        return { found: true, id: cb.id || cb.name || "unknown" };
+      }
+      return { found: false };
+    });
+    if (smapicChecked.found) {
+      console.log(`[forrent] + スマピク掲載: ON (${smapicChecked.id})`);
+      filled["スマピク掲載"] = true;
+    } else {
+      console.log("[forrent] ? スマピク掲載: checkbox not found in DOM");
     }
+  } catch (e) {
+    console.log(`[forrent] x スマピク掲載: ${e.message.slice(0, 60)}`);
   }
+
+  // ═══ 25. 見学予約（修正点3） ═══
+  // kengakuYoyaku: checkbox — ネット掲載=掲載(1)の場合は常にチェック
+  await setCheckbox(mainFrame, "kengakuYoyaku", true, "見学予約");
+  filled["見学予約"] = true;
 
   // ═══ 26. 店舗案内ピックアップ（修正点4） ═══
   await setCheckbox(mainFrame, "tenpiku", true, "店舗案内ピックアップ");
@@ -784,14 +854,19 @@ async function fillMoneyFields(f, data, ok) {
   }, ok);
 }
 
-/** 敷金/礼金: "1ヶ月" or "10万円" or "なし" */
+/** 敷金/礼金: "1ヶ月" or "10万円" or "50,000円" or "なし" */
 async function fillDeposit(f, raw, cfg, ok) {
-  if (!raw || raw === "ー" || /なし|0|^$/.test(raw)) {
+  if (!raw) {
     await setCheckbox(f, cfg.flgId, false, `${cfg.label}フラグ`);
     return;
   }
-  // "1ヶ月", "2ヶ月" pattern
-  const monthM = raw.match(/(\d+\.?\d*)ヶ?月/);
+  const s = raw.trim();
+  if (s === "ー" || s === "0" || /^なし$/i.test(s) || s === "") {
+    await setCheckbox(f, cfg.flgId, false, `${cfg.label}フラグ`);
+    return;
+  }
+  // "1ヶ月", "2ヶ月", "1か月", "1カ月" pattern
+  const monthM = s.match(/(\d+\.?\d*)(?:ヶ|か|カ)?月/);
   if (monthM) {
     await f.click(`#${cfg.monthId}`).catch(() => {});
     await f.waitForTimeout(200);
@@ -799,17 +874,39 @@ async function fillDeposit(f, raw, cfg, ok) {
     return;
   }
   // "10万円", "10.5万円" pattern
-  const yenM = raw.match(/([\d.]+)万/);
-  if (yenM) {
+  const manM = s.match(/([\d.]+)万/);
+  if (manM) {
     await f.click(`#${cfg.yenId}`).catch(() => {});
     await f.waitForTimeout(200);
-    const v = parseFloat(yenM[1]);
+    const v = parseFloat(manM[1]);
     ok(`${cfg.label}(万)`, await fillByName(f, cfg.n1, String(Math.floor(v)), `${cfg.label}(万)`));
     const sen = Math.round((v - Math.floor(v)) * 10);
     if (sen > 0) ok(`${cfg.label}(千)`, await fillByName(f, cfg.n2, String(sen), `${cfg.label}(千)`));
     return;
   }
-  // "保証金" 等のラベル誤取得、認識不能 → フラグOFFにして安全に処理
+  // "50,000円", "100000円" — convert to 万 unit
+  const yenM = s.match(/([\d,]+)\s*円/);
+  if (yenM) {
+    const yen = parseInt(yenM[1].replace(/,/g, ""), 10);
+    if (yen > 0) {
+      await f.click(`#${cfg.yenId}`).catch(() => {});
+      await f.waitForTimeout(200);
+      const man = Math.floor(yen / 10000);
+      const sen = Math.round((yen % 10000) / 1000);
+      ok(`${cfg.label}(万)`, await fillByName(f, cfg.n1, String(man), `${cfg.label}(万)`));
+      if (sen > 0) ok(`${cfg.label}(千)`, await fillByName(f, cfg.n2, String(sen), `${cfg.label}(千)`));
+      return;
+    }
+  }
+  // Pure number — treat as months
+  const numM = s.match(/^(\d+\.?\d*)$/);
+  if (numM) {
+    await f.click(`#${cfg.monthId}`).catch(() => {});
+    await f.waitForTimeout(200);
+    ok(`${cfg.label}`, await fillByName(f, cfg.n1, numM[1], `${cfg.label}(ヶ月)`));
+    return;
+  }
+  // Unrecognized format (e.g. "保証金") — flag OFF
   console.log(`[forrent] ? ${cfg.label}: unknown format "${raw}" → フラグOFF`);
   await setCheckbox(f, cfg.flgId, false, `${cfg.label}フラグ`);
 }
@@ -839,10 +936,23 @@ async function fillConditionRadios(mainFrame, reinsData, ok) {
   const setsubi = norm(reinsData.設備 || "");
   const joukenFree = norm(reinsData.条件フリー || "");
   const biko = norm(reinsData.備考3 || "");
-  const combined = [setsubi, joukenFree, biko].join(" ");
+  const setsubiFree = norm(reinsData.設備フリー || "");
+  const combined = [setsubi, joukenFree, biko, setsubiFree].join(" ");
 
-  // ペット可→2択の場合 idx1(最後)が「可」の可能性。安全のためidx0のままにする
-  // forrent.jpの2択radioの順序が確定するまで、全てidx0（41pt実績と同じ）を使用
+  // Detect pet/instrument/office/roomshare from REINS data
+  // 2-choice radio: idx0=不可, idx1=可
+  if (/ペット可|ペット相談|ペットOK|ペット飼育可|小型犬|猫/.test(combined)) {
+    overrides["petKbnCd"] = 1; // 可
+  }
+  if (/楽器可|楽器相談|楽器OK|ピアノ可/.test(combined)) {
+    overrides["gakkiKbnCd"] = 1; // 可
+  }
+  if (/事務所可|事務所利用可|SOHO|事務所相談/.test(combined)) {
+    overrides["jimushoRiyoKbnCd"] = 1; // 可
+  }
+  if (/ルームシェア可|ルームシェア相談/.test(combined)) {
+    overrides["roomShareKbnCd"] = 1; // 可
+  }
 
   let filledCount = 0;
   for (const [name, defaultIdx, label] of conditions) {
@@ -956,22 +1066,33 @@ async function fillTransportViaMap(page, mainFrame, transportArray) {
       await transportPopup.waitForLoadState("networkidle").catch(() => {});
       await transportPopup.waitForTimeout(3000);
 
-      // ラジオボタンを選択: 交通1=候補1, 交通2=候補2, 交通3=候補3
-      // （同一候補は選択不可のため、各スロットに異なる候補を割り当て）
+      // Dynamically assign radio buttons: detect available candidates and fill 3 slots
+      // Radio ID format: koutu_{slot}-{candidate} (slot: 1-3, candidate: 1-4)
       const radioResult = await transportPopup.evaluate(() => {
-        const selections = [
-          { id: "koutu_1-1", slot: 1, candidate: 1 },
-          { id: "koutu_2-2", slot: 2, candidate: 2 },
-          { id: "koutu_3-3", slot: 3, candidate: 3 },
-        ];
         const results = [];
-        for (const sel of selections) {
-          const radio = document.getElementById(sel.id);
+        // First detect how many candidates exist
+        let maxCandidate = 0;
+        for (let c = 1; c <= 4; c++) {
+          const r = document.getElementById(`koutu_1-${c}`);
+          if (r) maxCandidate = c;
+        }
+        // Assign slots: prefer diagonal (1-1, 2-2, 3-3) but fallback if fewer candidates
+        const assignments = [];
+        if (maxCandidate >= 3) {
+          assignments.push([1, 1], [2, 2], [3, 3]);
+        } else if (maxCandidate === 2) {
+          // Only 2 candidates: slot1=cand1, slot2=cand2, slot3=cand1 (repeat)
+          assignments.push([1, 1], [2, 2], [3, 1]);
+        } else if (maxCandidate === 1) {
+          assignments.push([1, 1], [2, 1], [3, 1]);
+        }
+        for (const [slot, cand] of assignments) {
+          const radio = document.getElementById(`koutu_${slot}-${cand}`);
           if (radio) {
             radio.checked = true;
             radio.dispatchEvent(new Event("change", { bubbles: true }));
             radio.dispatchEvent(new Event("click", { bubbles: true }));
-            results.push(`交通${sel.slot}=候補${sel.candidate}`);
+            results.push(`交通${slot}=候補${cand}`);
           }
         }
         return results;
@@ -1138,14 +1259,18 @@ async function fillTexts(mainFrame, catchCopy, freeComment, reinsData) {
   const biko = reinsData ? (reinsData.備考3 || reinsData.条件フリー || "") : "";
   const truncBiko = biko.slice(0, 200);
 
+  // Fixed text for net-facing fields (staff request)
+  const NET_CATCH = "お電話番号記載のお客様限定【仲介手数料割引キャンペーン中】";
+  const NET_FREE_MEMO = "お急ぎやご質問の方はファンテイズ03-6403-9323大木まで！現地お待ち合わせでご紹介できます！(他社掲載物件まとめて内見可能)家賃交渉、初期費用の相談などお気軽にご相談下さい！";
+
   // evaluate() で直接 DOM 操作（フレーム状態に左右されにくい）
   try {
-    const result = await mainFrame.evaluate(({ catchCopy, freeComment, biko }) => {
+    const result = await mainFrame.evaluate(({ catchCopy, freeComment, biko, netCatch, netFreeMemo }) => {
       const out = [];
       const fields = [
         { id: "bukkenCatch", val: catchCopy },
-        { id: "netCatch", val: catchCopy },
-        { id: "netFreeMemo", val: freeComment },
+        { id: "netCatch", val: netCatch },
+        { id: "netFreeMemo", val: netFreeMemo },
         { id: "freeMemo", val: freeComment },
       ];
       // 特記事項 — REINS備考があれば設定
@@ -1169,11 +1294,20 @@ async function fillTexts(mainFrame, catchCopy, freeComment, reinsData) {
       // etcHiyoShosai: etcHiyoFlg=ON時に必須
       // hoshoninDaikoShosai: 保証人代行会社の詳細
       const nameFields = [];
-      const etcText = biko || '鍵交換代・その他初期費用';
-      nameFields.push({ name: '${bukkenInputForm.etcHiyoShosai}', val: etcText.slice(0, 200), label: 'etcHiyoShosai' });
-      if (biko && /保証/.test(biko)) {
-        nameFields.push({ name: '${bukkenInputForm.hoshoninDaikoShosai}', val: biko.slice(0, 200), label: 'hoshoninDaikoShosai' });
+      // Extract only initial cost-related text from biko (not full text which may contain walk-to-station info)
+      let etcText = '鍵交換代・その他初期費用';
+      if (biko) {
+        const costKeywords = ['鍵交換', '消毒', 'クリーニング', '保険', '損保', '火災', '初期費用',
+          '鍵代', '消臭', '室内清掃', '安心サポート', '入居サポート', '24時間サポート',
+          '抗菌', '害虫駆除', '仲介手数料', '事務手数料', '書類作成'];
+        const sentences = biko.split(/[、。,\s\/]+/).filter(Boolean);
+        const costParts = sentences.filter(s => costKeywords.some(k => s.includes(k)));
+        if (costParts.length > 0) {
+          etcText = costParts.join('、');
+        }
       }
+      nameFields.push({ name: '${bukkenInputForm.etcHiyoShosai}', val: etcText.slice(0, 200), label: 'etcHiyoShosai' });
+      // hoshoninDaikoShosai is now set in fillFormFields (section 19)
       for (const nf of nameFields) {
         const el = document.querySelector('[name="' + nf.name + '"]');
         if (el) {
@@ -1186,7 +1320,7 @@ async function fillTexts(mainFrame, catchCopy, freeComment, reinsData) {
         }
       }
       return out;
-    }, { catchCopy: truncCatch, freeComment: truncComment, biko: truncBiko });
+    }, { catchCopy: truncCatch, freeComment: truncComment, biko: truncBiko, netCatch: NET_CATCH, netFreeMemo: NET_FREE_MEMO });
 
     const ok = result.filter(r => !r.startsWith("!"));
     const ng = result.filter(r => r.startsWith("!")).map(r => r.slice(1));
@@ -1389,27 +1523,35 @@ async function uploadImages(mainFrame, processedImages) {
     } else if (SHUHEN_CATS.includes(cat) && shuhenN <= 6) {
       const currentShuhen = shuhenN;
       inputName = `shuhenKankyo${shuhenN++}File`;
-      // 周辺環境メタデータ設定（カテゴリ + 施設名 + 距離）
-      // mokuteki{N} (select): 060203=コンビニ, destination{N} (text), distance{N} (text: m)
+      // Required categories per slot: コンビニ/スーパー/ドラッグストア/郵便局 + extras
+      const SHUHEN_CATEGORIES = [
+        { code: "060203", name: "コンビニ" },
+        { code: "060201", name: "スーパー" },
+        { code: "060210", name: "ドラッグストア" },
+        { code: "070201", name: "郵便局" },
+        { code: "060207", name: "病院" },
+        { code: "060204", name: "飲食店" },
+      ];
+      const catInfo = SHUHEN_CATEGORIES[currentShuhen - 1] || SHUHEN_CATEGORIES[0];
       try {
-        await mainFrame.evaluate(({ n }) => {
+        await mainFrame.evaluate(({ n, catCode, catName }) => {
           const catEl = document.getElementById(`mokuteki${n}`);
           if (catEl) {
-            catEl.value = "060203"; // コンビニ（デフォルト）
+            catEl.value = catCode;
             catEl.dispatchEvent(new Event("change", { bubbles: true }));
           }
           const nameEl = document.getElementById(`destination${n}`);
           if (nameEl) {
-            nameEl.value = "周辺環境";
+            nameEl.value = catName;
             nameEl.dispatchEvent(new Event("input", { bubbles: true }));
           }
           const distEl = document.getElementById(`distance${n}`);
           if (distEl) {
-            distEl.value = "100"; // 100m
+            distEl.value = "100";
             distEl.dispatchEvent(new Event("input", { bubbles: true }));
           }
-        }, { n: currentShuhen });
-        console.log(`[forrent] + 周辺環境${currentShuhen}メタ: コンビニ/100m`);
+        }, { n: currentShuhen, catCode: catInfo.code, catName: catInfo.name });
+        console.log(`[forrent] + 周辺環境${currentShuhen}メタ: ${catInfo.name}/100m`);
       } catch (e) {
         console.log(`[forrent] x 周辺環境メタ: ${e.message.slice(0, 60)}`);
       }
@@ -1445,8 +1587,8 @@ async function uploadImages(mainFrame, processedImages) {
     }
   }
 
-  // ★ 残りtsuikaGazoスロットを未使用カテゴリで埋める（その他画像 max 9pt）
-  // 既存画像を再利用して名寄せスコアの「カテゴリ充填」を最大化
+  // ★ 残りtsuikaGazoスロットを未使用カテゴリで埋める
+  // Create unique image variants (different crop/quality) to avoid duplicate detection
   const EXTRA_CATEGORIES = [
     { code: "040107", label: "収納" },
     { code: "040108", label: "バルコニー" },
@@ -1454,15 +1596,12 @@ async function uploadImages(mainFrame, processedImages) {
     { code: "040111", label: "セキュリティ" },
     { code: "050101", label: "眺望" },
   ];
-  // 使用済みカテゴリを集計
   const usedCodes = new Set();
   for (const img of items) {
     const cat = img.categoryLabel || "";
     const code = FORRENT_CATEGORY_MAP[cat];
     if (code) usedCodes.add(code);
   }
-  // 室内写真から再利用候補を取得（外観・間取り・周辺環境は除外）
-  // ★ 重複画像はスコア計上されないため、異なるファイルをラウンドロビンで使用
   const reuseImages = items.filter(img => INTERIOR_CATS.includes(img.categoryLabel || ""));
 
   if (reuseImages.length > 0 && tsuikaN <= 8) {
@@ -1475,10 +1614,25 @@ async function uploadImages(mainFrame, processedImages) {
       reuseIdx++;
       const inputName = `tsuikaGazo${tsuikaN++}File`;
       try {
-        const ok = await setFileInput(mainFrame, inputName, reuseImage.localPath);
+        // Create a unique variant: different crop offset + quality to avoid duplicate detection
+        const variantPath = reuseImage.localPath.replace(/\.jpg$/, `_var${reuseIdx}.jpg`);
+        const meta = await sharp(reuseImage.localPath).metadata();
+        const cropX = Math.min(reuseIdx * 3, Math.floor((meta.width || 1280) * 0.05));
+        const cropY = Math.min(reuseIdx * 2, Math.floor((meta.height || 960) * 0.05));
+        await sharp(reuseImage.localPath)
+          .extract({
+            left: cropX, top: cropY,
+            width: (meta.width || 1280) - cropX * 2,
+            height: (meta.height || 960) - cropY * 2,
+          })
+          .resize({ width: 1280, height: 960, fit: "cover" })
+          .jpeg({ quality: 82 - reuseIdx }) // slightly different quality each time
+          .toFile(variantPath);
+
+        const ok = await setFileInput(mainFrame, inputName, variantPath);
         if (ok) {
-          uploaded.push(reuseImage.localPath);
-          console.log(`[forrent] + image(fill): ${inputName} <- ${reuseImage.localPath.split("/").pop()} as ${extra.label}`);
+          uploaded.push(variantPath);
+          console.log(`[forrent] + image(variant): ${inputName} <- ${path.basename(variantPath)} as ${extra.label}`);
           await setImageCategory(mainFrame, inputName, extra.code, 0, tsuikaN - 1);
           console.log(`[forrent] + category: ${inputName} → ${extra.code} (${extra.label})`);
         }
@@ -1490,27 +1644,36 @@ async function uploadImages(mainFrame, processedImages) {
   }
 
   // ★ 周辺環境画像スロットのフォールバック
-  // cat_14（周辺環境）画像がREINSになかった場合、外観画像で代用
+  // cat_14（周辺環境）画像がREINSになかった場合、外観画像で代用して必須4カテゴリを設定
   if (shuhenN === 1 && items.length > 0) {
     const fallbackImg = items.find(img => GAIKAN_CATS.includes(img.categoryLabel || "")) || items[0];
-    try {
-      const ok = await setFileInput(mainFrame, "shuhenKankyo1File", fallbackImg.localPath);
-      if (ok) {
-        uploaded.push(fallbackImg.localPath);
-        // メタデータも設定（コンビニ/100m）
-        await mainFrame.evaluate(() => {
-          const catEl = document.getElementById("mokuteki1");
-          if (catEl) { catEl.value = "060203"; catEl.dispatchEvent(new Event("change", { bubbles: true })); }
-          const nameEl = document.getElementById("destination1");
-          if (nameEl) { nameEl.value = "周辺環境"; nameEl.dispatchEvent(new Event("input", { bubbles: true })); }
-          const distEl = document.getElementById("distance1");
-          if (distEl) { distEl.value = "100"; distEl.dispatchEvent(new Event("input", { bubbles: true })); }
-        });
-        console.log(`[forrent] + image(shuhen-fallback): shuhenKankyo1File <- ${fallbackImg.localPath.split("/").pop()}`);
+    const FALLBACK_SHUHEN = [
+      { code: "060203", name: "コンビニ" },
+      { code: "060201", name: "スーパー" },
+      { code: "060210", name: "ドラッグストア" },
+      { code: "070201", name: "郵便局" },
+    ];
+    for (let si = 0; si < FALLBACK_SHUHEN.length && (shuhenN + si) <= 6; si++) {
+      const slotN = si + 1;
+      const cat = FALLBACK_SHUHEN[si];
+      try {
+        const okResult = await setFileInput(mainFrame, `shuhenKankyo${slotN}File`, fallbackImg.localPath);
+        if (okResult) {
+          uploaded.push(fallbackImg.localPath);
+          await mainFrame.evaluate(({ n, catCode, catName }) => {
+            const catEl = document.getElementById(`mokuteki${n}`);
+            if (catEl) { catEl.value = catCode; catEl.dispatchEvent(new Event("change", { bubbles: true })); }
+            const nameEl = document.getElementById(`destination${n}`);
+            if (nameEl) { nameEl.value = catName; nameEl.dispatchEvent(new Event("input", { bubbles: true })); }
+            const distEl = document.getElementById(`distance${n}`);
+            if (distEl) { distEl.value = "100"; distEl.dispatchEvent(new Event("input", { bubbles: true })); }
+          }, { n: slotN, catCode: cat.code, catName: cat.name });
+          console.log(`[forrent] + image(shuhen-fallback): shuhenKankyo${slotN}File <- ${fallbackImg.localPath.split("/").pop()} as ${cat.name}`);
+        }
+        await mainFrame.waitForTimeout(1000);
+      } catch (e) {
+        console.log(`[forrent] x shuhen-fallback(${slotN}): ${e.message.slice(0, 60)}`);
       }
-      await mainFrame.waitForTimeout(1000);
-    } catch (e) {
-      console.log(`[forrent] x shuhen-fallback: ${e.message.slice(0, 60)}`);
     }
   }
 
@@ -1722,6 +1885,64 @@ const SETSUBI_TO_TOKUCHO = {
   "陽当り":             ["2903"],
   "日当たり":           ["2903"],
   "南向き":             ["1001"],
+
+  // ── Additional mappings for coverage ──
+  // 交通・立地
+  "2沿線":              ["0103"],
+  "3沿線":              ["0105"],
+  "2駅":                ["0102"],
+  "3駅":                ["0104"],
+
+  // セキュリティ追加
+  "管理人":             ["1215"],
+  "コンシェルジュ":     ["1216"],
+  "管理人常駐":         ["1215"],
+
+  // キッチン追加
+  "2口コンロ":          ["1414"],
+  "2口":                ["1414"],
+  "コンロ2口":          ["1414"],
+  "食器棚":             ["1431"],
+
+  // バス追加
+  "追い炊き":           ["1505"],
+  "おいだき":           ["1505"],
+
+  // 室内設備追加
+  "二重サッシ":         ["2122"],
+  "ペアサッシ":         ["2122"],
+  "出窓":               ["2115"],
+  "ルームクリーニング": ["2601"],
+  "クリーニング済":     ["2601"],
+
+  // 収納追加
+  "W.I.C":              ["2204"],
+  "W.I.C.":             ["2204"],
+  "ウォークスルー":     ["2205"],
+  "パントリー":         ["2216"],
+
+  // 通信追加
+  "Wi-Fi":              ["2408"],
+  "WiFi":               ["2408"],
+  "無料インターネット": ["2406"],
+  "ネット無料":         ["2406"],
+
+  // 共用部追加
+  "ゲストルーム":       ["0524"],
+  "ラウンジ":           ["0525"],
+  "フィットネス":       ["0523"],
+  "ジム":               ["0523"],
+  "キッズルーム":       ["0526"],
+  "屋上":               ["0528"],
+
+  // 条件追加
+  "2人入居可":          ["2704"],
+  "二人入居可":         ["2704"],
+  "女性限定":           ["2706"],
+  "女性専用":           ["2706"],
+  "初期費用カード":     ["2734"],
+  "クレジットカード":   ["2734"],
+  "家賃カード":         ["2733"],
 };
 
 // 建物属性から推定できる特徴項目（修正点13: 全マッピング）
@@ -1936,19 +2157,40 @@ async function fillShuhenKankyo(page, mainFrame) {
       console.log(`[forrent]   [${f.checked ? "☑" : "☐"}] ${f.text.slice(0, 80)}`);
     }
 
-    // チェックボックスがある場合: 最大6件を選択
+    // Select up to 6 facilities, prioritizing required categories
     if (facilityInfo.checkboxes > 0 && facilityInfo.checkedCount === 0) {
-      // 未チェックなら最初の6件をチェック
-      await popup.evaluate(() => {
-        const cbs = [...document.querySelectorAll("input[type='checkbox']")].slice(0, 6);
-        for (const cb of cbs) {
-          if (!cb.checked) {
-            cb.checked = true;
-            cb.dispatchEvent(new Event("change", { bubbles: true }));
+      const selectedCount = await popup.evaluate(() => {
+        const cbs = [...document.querySelectorAll("input[type='checkbox']")];
+        const selected = [];
+        // Priority categories to find (by text match in row)
+        const priorities = ["コンビニ", "スーパー", "ドラッグストア", "薬局", "郵便局", "病院", "学校"];
+        // First pass: select priority categories
+        for (const keyword of priorities) {
+          if (selected.length >= 6) break;
+          for (const cb of cbs) {
+            if (selected.includes(cb)) continue;
+            const tr = cb.closest("tr");
+            const text = tr ? tr.textContent : "";
+            if (text.includes(keyword)) {
+              cb.checked = true;
+              cb.dispatchEvent(new Event("change", { bubbles: true }));
+              selected.push(cb);
+              break; // one per category
+            }
           }
         }
+        // Second pass: fill remaining slots
+        for (const cb of cbs) {
+          if (selected.length >= 6) break;
+          if (!selected.includes(cb)) {
+            cb.checked = true;
+            cb.dispatchEvent(new Event("change", { bubbles: true }));
+            selected.push(cb);
+          }
+        }
+        return selected.length;
       });
-      console.log("[forrent] 周辺環境: 最初の6件を自動選択");
+      console.log(`[forrent] 周辺環境: ${selectedCount}件を優先順で自動選択`);
     }
 
     // 「登録」/「確定」/「反映」ボタンをクリック

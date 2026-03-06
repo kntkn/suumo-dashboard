@@ -14,6 +14,7 @@ const forrent = require("./skills/forrent");
 const { analyzeAndCropImages } = require("./skills/image-ai");
 const { generateTexts } = require("./skills/text-ai");
 const { checkImageSufficiency, fetchBukakuImages } = require("./skills/bukaku-images");
+const { fetchShuhenPhotos } = require("./skills/google-images");
 
 const dev = process.env.NODE_ENV !== "production";
 const nextApp = next({ dev });
@@ -95,23 +96,45 @@ async function runNyuko(socket, reinsId) {
     emit(3, "done", `${processedImages.length}枚のカテゴリ画像を生成`);
 
     // ── Step 3.5: 物確プラットフォームから追加画像 ──
-    const sufficiency = checkImageSufficiency(processedImages);
+    let sufficiency = checkImageSufficiency(processedImages);
     if (sufficiency.insufficient) {
-      emit(3, "running", `5ptカテゴリ不足(${sufficiency.missingCategories.join(",")}) → 物確画像を取得中...`);
+      emit(3, "running", `5ptカテゴリ不足(${sufficiency.missing5pt.join(",")}) → 物確画像を取得中...`);
       try {
         const bukakuImages = await fetchBukakuImages(context, reinsData, downloadDir);
         if (bukakuImages.length > 0) {
           const existingCats = processedImages.map(img => img.categoryId);
           const bukakuProcessed = await analyzeAndCropImages(bukakuImages, downloadDir, existingCats);
           processedImages.push(...bukakuProcessed);
-          emit(3, "done", `${processedImages.length}枚（REINS ${processedImages.length - bukakuProcessed.length} + 物確 ${bukakuProcessed.length}）`);
-        } else {
-          emit(3, "done", `${processedImages.length}枚（物確画像なし）`);
+          emit(3, "running", `物確から${bukakuProcessed.length}枚追加`);
         }
       } catch (e) {
         console.error("[bukaku] Error:", e.message);
-        emit(3, "done", `${processedImages.length}枚（物確取得エラー: ${e.message.slice(0, 50)}）`);
       }
+
+      emit(3, "done", `${processedImages.length}枚`);
+    }
+
+    // ── Step 3.7: 周辺環境写真をGoogle Mapsから取得 ──
+    emit(3, "running", "周辺環境写真をGoogle Maps + 画像検索で取得中...");
+    try {
+      const shuhenPhotos = await fetchShuhenPhotos(context, reinsData, downloadDir);
+      if (shuhenPhotos.length > 0) {
+        // Add shuhen photos as "周辺環境" category
+        for (const photo of shuhenPhotos) {
+          processedImages.push({
+            localPath: photo.localPath,
+            categoryId: "14",
+            categoryLabel: "周辺環境",
+            sourceIndex: 200 + shuhenPhotos.indexOf(photo),
+          });
+        }
+        emit(3, "done", `${processedImages.length}枚（周辺環境${shuhenPhotos.length}枚含む）`);
+      } else {
+        emit(3, "done", `${processedImages.length}枚`);
+      }
+    } catch (e) {
+      console.error("[shuhen] Error:", e.message);
+      emit(3, "done", `${processedImages.length}枚`);
     }
 
     // ── Step 4: AIテキスト生成 ──

@@ -33,10 +33,14 @@ const SUUMO_CATEGORIES = [
  * 1枚の画像をClaude Visionで分類
  * @param {Buffer} imageBuffer - JPEG画像バッファ
  * @param {Array<{id: string, label: string}>} availableCategories - 使用可能なカテゴリ
+ * @param {string} [reinsTitle] - REINS画像カードのタイトルテキスト（分類ヒント）
  * @returns {string|null} カテゴリID
  */
-async function classifySingleImage(imageBuffer, availableCategories) {
+async function classifySingleImage(imageBuffer, availableCategories, reinsTitle) {
   const catList = availableCategories.map((c) => `${c.id}=${c.label}`).join(", ");
+
+  // Use REINS title as hint if available
+  const hintLine = reinsTitle ? `\nREINS上のタイトル: 「${reinsTitle}」（参考情報として活用してください）` : "";
 
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
@@ -55,10 +59,22 @@ async function classifySingleImage(imageBuffer, availableCategories) {
           },
           {
             type: "text",
-            text: `この不動産写真を1つのカテゴリに分類してください。
+            text: `この不動産物件写真を1つのカテゴリに分類してください。
 カテゴリ: ${catList}
-ただし、QRコードの画像の場合は「QR」とだけ回答してください。
-IDのみ回答（例: 01）。間取り図・平面図は必ず04。建物外観は05。QRコードはQR。`,
+${hintLine}
+
+判定基準:
+- 間取り図・平面図・フロアプラン → 必ず04
+- 建物の外観写真（外から撮影） → 05
+- リビング・ダイニング・居間（広い部屋、ソファ、テーブル） → 01
+- 洋室（ベッド、クローゼットのある個室） → 06
+- キッチン（コンロ、シンク、調理台） → 02
+- バスルーム・浴室（浴槽、シャワー） → 03
+- トイレ（便器が写っている） → 08
+- 洗面台・洗面所 → 09
+- QRコードの画像 → 「QR」とだけ回答
+
+IDのみ回答（例: 01）。`,
           },
         ],
       },
@@ -66,11 +82,9 @@ IDのみ回答（例: 01）。間取り図・平面図は必ず04。建物外観
   });
 
   const text = response.content[0].text.trim();
-  // QRコード検出（修正点14）
   if (/QR/i.test(text)) {
     return "QR";
   }
-  // IDを抽出（2桁の数字）
   const match = text.match(/\b(\d{2})\b/);
   if (match && availableCategories.find((c) => c.id === match[1])) {
     return match[1];
@@ -104,12 +118,40 @@ async function analyzeAndCropImages(downloaded, downloadDir, existingCategories 
 
     let catId = null;
     try {
-      catId = await classifySingleImage(buffer, available);
+      catId = await classifySingleImage(buffer, available, img.title || "");
     } catch (err) {
       console.error(`[image] Vision failed #${img.index}:`, err.message);
     }
 
-    // フォールバック: 5ptカテゴリを優先的に埋める
+    // REINS title-based fallback: try to match title to a category before random fallback
+    if (!catId && img.title) {
+      const titleLower = img.title.toLowerCase();
+      const titleMap = {
+        "間取": "04", "平面図": "04", "フロア": "04",
+        "外観": "05", "建物": "05",
+        "リビング": "01", "居室": "01", "LD": "01",
+        "キッチン": "02", "台所": "02",
+        "バス": "03", "浴室": "03", "風呂": "03",
+        "洋室": "06", "ベッドルーム": "06",
+        "和室": "07",
+        "トイレ": "08",
+        "洗面": "09",
+        "玄関": "10",
+        "収納": "11", "クローゼット": "11",
+        "バルコニー": "12", "ベランダ": "12",
+        "エントランス": "13", "共用": "13",
+        "周辺": "14",
+      };
+      for (const [key, id] of Object.entries(titleMap)) {
+        if (titleLower.includes(key.toLowerCase()) && available.find((c) => c.id === id)) {
+          catId = id;
+          console.log(`[image] #${img.index} → title fallback: "${img.title}" → ${id}`);
+          break;
+        }
+      }
+    }
+
+    // Final fallback: fill high-score categories first
     if (!catId) {
       const fallback = available.find((c) => c.score === 5) || available[0];
       catId = fallback?.id;
@@ -151,11 +193,13 @@ async function analyzeAndCropImages(downloaded, downloadDir, existingCategories 
     }
   }
 
-  // Sort: 5-point categories first
+  // Sort by staff-specified order:
+  // 間取り→外観→リビング→その他・洋室→キッチン→バス→トイレ→洗面設備→収納→その他設備→エントランス→ロビー→その他共有部分→その他
+  const UPLOAD_ORDER = ["04", "05", "01", "06", "02", "03", "08", "09", "11", "10", "12", "13", "14", "07"];
   return processedImages.sort((a, b) => {
-    const scoreA = SUUMO_CATEGORIES.find((c) => c.id === a.categoryId)?.score || 0;
-    const scoreB = SUUMO_CATEGORIES.find((c) => c.id === b.categoryId)?.score || 0;
-    return scoreB - scoreA;
+    const idxA = UPLOAD_ORDER.indexOf(a.categoryId);
+    const idxB = UPLOAD_ORDER.indexOf(b.categoryId);
+    return (idxA === -1 ? 99 : idxA) - (idxB === -1 ? 99 : idxB);
   });
 }
 
